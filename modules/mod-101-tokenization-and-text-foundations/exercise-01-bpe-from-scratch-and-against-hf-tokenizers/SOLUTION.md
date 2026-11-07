@@ -113,12 +113,12 @@ The companion baseline uses `tokenizers` (Hugging Face's Rust-backed library). T
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.pre_tokenizers import WhitespaceSplit
 
 
 def train_hf_bpe(corpus_path: str, vocab_size: int) -> Tokenizer:
     tok = Tokenizer(BPE(unk_token="[UNK]", end_of_word_suffix="</w>"))
-    tok.pre_tokenizer = Whitespace()
+    tok.pre_tokenizer = WhitespaceSplit()
     trainer = BpeTrainer(
         vocab_size=vocab_size,
         special_tokens=["[UNK]"],
@@ -129,7 +129,12 @@ def train_hf_bpe(corpus_path: str, vocab_size: int) -> Tokenizer:
     return tok
 ```
 
-`Whitespace` pre-tokenisation is the right choice when matching the from-scratch trainer above, which also splits on whitespace. The `end_of_word_suffix="</w>"` on both the `BPE` model and the `BpeTrainer` is what makes the comparison honest: the scratch implementation appends `</w>` to every training word and allows merges involving the marker, so the HF baseline must learn the same suffix or its symbol inventory and merge statistics will diverge by construction. Pick `ByteLevel` if you want GPT-2-style byte BPE instead — then drop the `end_of_word_suffix` on both sides, and switch the from-scratch implementation's alphabet to the 256-entry byte→unicode map that `tokenizers` uses (see `tokenizers.pre_tokenizers.ByteLevel.alphabet()`).
+Two parity knobs make this comparison honest, and both must be set:
+
+- `WhitespaceSplit` (not `Whitespace`) matches the scratch implementation's `line.split()` exactly — it splits on whitespace only. `Whitespace` additionally splits on punctuation, which would peel `.`/`,`/`?` off words before merges are counted and make the HF symbol inventory diverge from the scratch one on even plain ASCII input.
+- `end_of_word_suffix="</w>"` on *both* the `BPE` model and the `BpeTrainer`. The scratch implementation appends `</w>` to every training word and allows merges involving the marker; without the matching suffix on the HF side, the two trainers accumulate pair statistics over different symbol inventories and the merge lists cannot be compared.
+
+Pick `ByteLevel` pre-tokenisation if you want GPT-2-style byte BPE instead — then drop the `end_of_word_suffix` on both sides, and switch the from-scratch implementation's alphabet to the 256-entry byte→unicode map that `tokenizers` uses (see `tokenizers.pre_tokenizers.ByteLevel.alphabet()`).
 
 ### 2.3 Comparison harness
 

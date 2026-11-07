@@ -38,19 +38,20 @@ def train_unigram(corpus_path: str, vocab_size: int, model_prefix: str) -> None:
         model_type="unigram",
         vocab_size=vocab_size,
         character_coverage=0.9995,  # per SP guidance for Latin scripts
-        normalization_rule_name="nmt_nfkc",
+        normalization_rule_name="nfkc",  # plain NFKC; matches WordPiece side below
     )
 
 
 def train_wordpiece(corpus_path: str, vocab_size: int, out_path: str) -> None:
     tok = Tokenizer(WordPiece(unk_token="[UNK]"))
-    # Match SentencePiece's `nmt_nfkc`: NFKC is the core compatibility normalisation
-    # (ligatures, full-width → half-width, superscripts); the "nmt_" prefix also strips
-    # control characters and trims whitespace, which `BertPreTokenizer` already handles
-    # downstream. `BertPreTokenizer` is pre-tokenisation only — it does NOT normalise —
-    # so without an explicit `tok.normalizer` the WordPiece pipeline would skip
-    # compatibility normalisation entirely and the Unigram/WordPiece delta would
-    # conflate algorithm differences with normalisation differences.
+    # Match SentencePiece's normaliser exactly. We set SP to `nfkc` (not the default
+    # `nmt_nfkc`, which additionally collapses whitespace and strips control chars)
+    # so plain `normalizers.NFKC()` here is byte-equivalent on both sides.
+    # `BertPreTokenizer` is pre-tokenisation only — it does NOT normalise — so without
+    # this explicit `tok.normalizer` the WordPiece pipeline would skip compatibility
+    # normalisation entirely (leaving `ﬁ`, full-width letters, superscripts unfolded)
+    # and the Unigram/WordPiece delta would conflate algorithm differences with
+    # normalisation differences.
     tok.normalizer = normalizers.NFKC()
     tok.pre_tokenizer = BertPreTokenizer()
     trainer = WordPieceTrainer(
@@ -65,7 +66,7 @@ def train_wordpiece(corpus_path: str, vocab_size: int, out_path: str) -> None:
 Two pragmatic choices worth flagging:
 
 - **Matched vocab size.** For a fair comparison, both trainers must *target* the same total vocabulary size (e.g. 16 000 or 32 000). SentencePiece's count includes special tokens and the initial character set; so does `WordPieceTrainer`. Specify the same number on both sides and verify after training (`len(sp.get_piece_size())` vs `tokenizer.get_vocab_size()`).
-- **Matched normalisation.** SentencePiece applies `nmt_nfkc` by default (NFKC plus whitespace collapsing); `BertPreTokenizer` is pre-tokenisation only and performs no normalisation, so WordPiece without an explicit `tok.normalizer` sees raw compatibility characters (`ﬁ`, `Ⅳ`, full-width letters) that SentencePiece has already folded. The snippet above attaches a matching `NFKC` normaliser to WordPiece so the two trainers see the same input; if you prefer the classic BERT recipe (`BertNormalizer(lowercase=True, strip_accents=True)`), apply the *same* recipe upstream of SentencePiece — either way, keep normalisation identical so the delta you measure is the *algorithm* delta.
+- **Matched normalisation.** SentencePiece's *default* is `nmt_nfkc` (NFKC plus whitespace collapsing and control-char stripping); `BertPreTokenizer` is pre-tokenisation only and performs no normalisation, so WordPiece without an explicit `tok.normalizer` sees raw compatibility characters (`ﬁ`, `Ⅳ`, full-width letters) that SentencePiece has already folded. Rather than paper over the mismatch, the snippet above sets SentencePiece to plain `nfkc` *and* attaches `normalizers.NFKC()` to WordPiece — identical NFKC on both sides, no silent "nmt_" extras to reconcile. If you prefer the classic BERT recipe (`BertNormalizer(lowercase=True, strip_accents=True)`), apply the *same* recipe upstream of SentencePiece via `normalization_rule_tsv` or by pre-normalising the corpus — either way, keep normalisation identical so the delta you measure is the *algorithm* delta.
 
 ### 2.2 Evaluation protocol
 
