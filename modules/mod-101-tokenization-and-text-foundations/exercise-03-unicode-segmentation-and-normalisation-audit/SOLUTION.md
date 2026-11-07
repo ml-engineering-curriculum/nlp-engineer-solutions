@@ -81,7 +81,7 @@ samples = [
     "café",                       # 1: NFC vs NFD; 4 vs 5 code points
     "ﬁ",                          # 2: ligature; NFKC → "fi"
     "Ⅳ",                          # 3: Roman numeral; NFKC → "IV"
-    "👩‍🔬",                        # 4: ZWJ sequence; 1 grapheme, 4 code points
+    "👩‍🔬",                        # 4: ZWJ sequence; 1 grapheme, 3 code points
     "नमस्ते",                      # 5: Devanagari conjunct; graphemes ≠ chars
     "paypaΙ.com",                 # 6: Latin 'l' replaced with Greek capital iota (confusable)
     "    Hello World",       # 7: NBSP vs regular space
@@ -93,7 +93,7 @@ Expected observations, which the writeup should enumerate:
 - **(1) `"café"`.** `len(NFC) == 4`, `len(NFD) == 5` because `é` → `e` + U+0301. A tokeniser that normalises to NFC and then diffs against user input in NFD will report a false mismatch on the trailing combining mark.
 - **(2) `"ﬁ"` ligature.** NFC leaves it; NFKC turns it into `"fi"`. Matters for search ("find all 'fi'") and for any string equality check. UAX #15 is explicit that NFKC is lossy and should not be reversed.
 - **(3) `"Ⅳ"` roman numeral.** NFKC → `"IV"`. For numeric extraction this is a *gain*; for preserving the original glyph (e.g. legal document faithful rendering) it is a *loss*.
-- **(4) Emoji ZWJ sequence.** `len(str) == 4` code points; `grapheme_clusters(s) == ["👩‍🔬"]` — one perceived character. A naive tokeniser that returns character offsets will split the woman-scientist emoji across three tokens, and offset-mapping back to the source will land mid-grapheme.
+- **(4) Emoji ZWJ sequence.** `len(str) == 3` code points (woman + U+200D ZWJ + microscope); `grapheme_clusters(s) == ["👩‍🔬"]` — one perceived character. A naive tokeniser that returns character offsets will split the woman-scientist emoji across three tokens, and offset-mapping back to the source will land mid-grapheme.
 - **(5) Devanagari `नमस्ते`.** 6 code points, 4 grapheme clusters. Any UI highlight that uses code-point offsets will highlight the wrong substring.
 - **(6) Confusable-script host.** `"paypaΙ.com"` contains a Greek capital iota where ASCII expects `l`. NFKC does *not* fix this (iota and L are different letters). The audit must flag mixed-script runs explicitly — this is the UTS #39 confusable-detection problem.
 - **(7) NBSP vs space.** Python's `str.split()` will handle U+00A0 (NBSP) as whitespace, but naive `line.split(" ")` will not. Models trained with one and served with the other show silent fertility inflation.
@@ -115,7 +115,7 @@ For a typical NLP service, the audited and documented defaults are:
 
 1. **Round-trip the canonical form.** `assert unicodedata.normalize("NFC", unicodedata.normalize("NFC", x)) == unicodedata.normalize("NFC", x)` — normalisation is idempotent; a second pass should be a no-op.
 2. **Idempotence of the full pipeline.** `pipeline(pipeline(x)) == pipeline(x)` for representative samples. If false, you have a stage that re-normalises differently on second pass (often `lower()` interacting with Turkish locale).
-3. **Grapheme-vs-codepoint test.** `len(regex.findall(r"\X", "👩‍🔬")) == 1`. If your offset-mapping returns `(0, 1)` for the first user-visible character and that character is `"👩‍🔬"`, you are returning *code-point* offsets, not grapheme-cluster offsets — document or fix.
+3. **Grapheme-vs-codepoint test.** `len(regex.findall(r"\X", "👩‍🔬")) == 1`, but `len("👩‍🔬") == 3` because the string is three code points (woman + ZWJ + microscope). The full first grapheme therefore has *grapheme-cluster* offsets `(0, 1)` and *code-point* offsets `(0, 3)`. If your offset-mapping returns `(0, 3)` for the first user-visible character, you are returning code-point offsets; if it returns `(0, 1)`, you are returning grapheme-cluster offsets. Document which, and ensure the choice matches what your clients expect — reversing the diagnosis sends learners off to "fix" correct offset handling.
 4. **ICU parity spot-check.** On 100 held-out multilingual lines, compare your UAX #29 word tokens against `PyICU.BreakIterator.createWordInstance(Locale("root"))`. Non-trivial divergence means your regex isn't truly UAX #29.
 5. **Mixed-script scan.** Run `mixed_script_runs` on a corpus; flag any non-trivial run that mixes Latin with Greek, Cyrillic, or Han — classic homograph pattern.
 6. **Normalisation-collision scan.** Count distinct NFC strings whose NFKC form collides; investigate the top collisions. Expected offenders: compatibility ligatures, superscript digits, full-width punctuation.

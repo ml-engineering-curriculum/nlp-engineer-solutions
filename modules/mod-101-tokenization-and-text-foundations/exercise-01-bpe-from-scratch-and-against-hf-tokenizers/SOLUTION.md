@@ -117,18 +117,19 @@ from tokenizers.pre_tokenizers import Whitespace
 
 
 def train_hf_bpe(corpus_path: str, vocab_size: int) -> Tokenizer:
-    tok = Tokenizer(BPE(unk_token="[UNK]"))
+    tok = Tokenizer(BPE(unk_token="[UNK]", end_of_word_suffix="</w>"))
     tok.pre_tokenizer = Whitespace()
     trainer = BpeTrainer(
         vocab_size=vocab_size,
         special_tokens=["[UNK]"],
+        end_of_word_suffix="</w>",
         show_progress=False,
     )
     tok.train([corpus_path], trainer)
     return tok
 ```
 
-`Whitespace` pre-tokenisation is the right choice when matching the from-scratch trainer above, which also splits on whitespace. Pick `ByteLevel` if you want GPT-2-style byte BPE instead — then the from-scratch implementation needs to switch its alphabet to the 256-entry byte→unicode map that `tokenizers` uses (see `tokenizers.pre_tokenizers.ByteLevel.alphabet()`).
+`Whitespace` pre-tokenisation is the right choice when matching the from-scratch trainer above, which also splits on whitespace. The `end_of_word_suffix="</w>"` on both the `BPE` model and the `BpeTrainer` is what makes the comparison honest: the scratch implementation appends `</w>` to every training word and allows merges involving the marker, so the HF baseline must learn the same suffix or its symbol inventory and merge statistics will diverge by construction. Pick `ByteLevel` if you want GPT-2-style byte BPE instead — then drop the `end_of_word_suffix` on both sides, and switch the from-scratch implementation's alphabet to the 256-entry byte→unicode map that `tokenizers` uses (see `tokenizers.pre_tokenizers.ByteLevel.alphabet()`).
 
 ### 2.3 Comparison harness
 
@@ -173,7 +174,7 @@ A worked expectation for the written-up answer: report (a) merge-list Jaccard, (
 ## 3. Validation steps
 
 1. **Unit-test the merge loop on a toy corpus** — the paper's `low lower newest widest` example should produce the merges `(e, s), (es, t), (l, o)…` in that order; a correct implementation reproduces this.
-2. **Round-trip test** — `" ".join(tok.replace(END, " ") for tok in encode(x, merges))` should equal `x` for any whitespace-tokenised input.
+2. **Round-trip test** — `"".join(encode(x, merges)).replace(END, " ").rstrip()` should equal `" ".join(x.split())` for any whitespace-tokenised input. Join the pieces *without* spaces (they are subword pieces, not words), then let the end-of-word marker reconstitute the single inter-word space; `rstrip` drops the trailing space from the final word's marker. Joining with `" "` instead inserts whitespace *inside* words and will fail on even trivial inputs — e.g. after two merges on `"hello world"`, the pieces might be `["h", "e", "l", "l", "o</w>", "wor", "l", "d</w>"]`, so the space-join expression produces `"h e l l o   wor l d  "` rather than `"hello world"`.
 3. **Determinism test** — train twice with the same seed and corpus, assert identical merge lists.
 4. **Vocab-size parity** — confirm that `len(set(merges))` plus the initial alphabet plus specials equals the `vocab_size` you asked `BpeTrainer` for. If not, your parity math (§2.3) is off.
 5. **Overlap report** — compute `len(set(my_merges) & set(hf_merges)) / len(set(my_merges) | set(hf_merges))` on the first `k` merges for `k ∈ {100, 500, num_merges}`. High-k overlap is what demonstrates parity.
