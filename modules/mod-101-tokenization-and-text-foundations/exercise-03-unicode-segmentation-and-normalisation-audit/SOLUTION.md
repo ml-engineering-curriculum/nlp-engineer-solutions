@@ -84,7 +84,7 @@ samples = [
     "👩‍🔬",                        # 4: ZWJ sequence; 1 grapheme, 4 code points
     "नमस्ते",                      # 5: Devanagari conjunct; graphemes ≠ chars
     "paypaΙ.com",                 # 6: Latin 'l' replaced with Greek capital iota (confusable)
-    "    Hello World",       # 7: NBSP vs regular space
+    "    Hello World",       # 7: NBSP vs regular space
 ]
 ```
 
@@ -96,7 +96,7 @@ Expected observations, which the writeup should enumerate:
 - **(4) Emoji ZWJ sequence.** `len(str) == 4` code points; `grapheme_clusters(s) == ["👩‍🔬"]` — one perceived character. A naive tokeniser that returns character offsets will split the woman-scientist emoji across three tokens, and offset-mapping back to the source will land mid-grapheme.
 - **(5) Devanagari `नमस्ते`.** 6 code points, 4 grapheme clusters. Any UI highlight that uses code-point offsets will highlight the wrong substring.
 - **(6) Confusable-script host.** `"paypaΙ.com"` contains a Greek capital iota where ASCII expects `l`. NFKC does *not* fix this (iota and L are different letters). The audit must flag mixed-script runs explicitly — this is the UTS #39 confusable-detection problem.
-- **(7) NBSP vs space.** Python's `str.split()` will handle ` ` as whitespace, but naive `line.split(" ")` will not. Models trained with one and served with the other show silent fertility inflation.
+- **(7) NBSP vs space.** Python's `str.split()` will handle U+00A0 (NBSP) as whitespace, but naive `line.split(" ")` will not. Models trained with one and served with the other show silent fertility inflation.
 
 ### 2.4 Recommended pipeline defaults
 
@@ -137,7 +137,7 @@ For a typical NLP service, the audited and documented defaults are:
 - **Assuming code points = characters.** `len("👩‍🔬") == 4`. Any offset API that counts code points and claims to return "character offsets" will silently split emoji, flags, and Indic conjuncts.
 - **Using `str.lower()` for case-insensitive matching.** `"STRAẞE".lower() == "straße"`, but you cannot reverse it, and `"straße".lower() == "straße"` while `"STRASSE".lower() == "strasse"` — so "STRAẞE" and "STRASSE" compare unequal after lower but equal after `casefold()`. Casefold is the correct primitive.
 - **NFKC-everywhere.** Applying NFKC in the ingest path destroys information that later stages may need: ligatures, superscripts, full-width punctuation — all legitimately distinct in display. Keep the original and NFKC a *copy* for search/dedup.
-- **Ignoring BOM.** Files produced on Windows often start with `﻿`; left in, it becomes a visible leading token in most tokenisers. Strip explicitly in ingest.
+- **Ignoring BOM.** Files produced on Windows often start with a BOM (U+FEFF); left in, it becomes a visible leading token in most tokenisers. Strip explicitly in ingest.
 - **Regex `\w` under `re`, not `regex`.** Python stdlib `re`'s `\w` is Unicode-aware for letters but does not match UAX #29 word boundaries. Use the third-party `regex` module for UAX #29 semantics.
 - **Normalising inside the model's tokeniser silently.** Many pre-trained tokenisers apply their own normalisation (e.g. BERT does NFD + strip-accents). If you also normalise upstream, document that the model sees *your* output after *its* normalisation; otherwise accented inputs get stripped twice and offsets drift.
 - **Treating "visually identical" as "equal".** Confusable-script attacks (`рaypal.com` with Cyrillic `р`) survive naïve normalisation. Needs UTS #39 handling.
