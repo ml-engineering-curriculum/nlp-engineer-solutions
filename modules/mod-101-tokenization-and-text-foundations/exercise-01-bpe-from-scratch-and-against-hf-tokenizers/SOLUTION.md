@@ -18,7 +18,7 @@ The deliverable is: a short Python module with a training function and an encodi
 
 ### 2.1 Minimal BPE in pure Python
 
-The reference implementation below is adapted from the pseudocode in the original BPE paper (Sennrich et al. 2016, §3.2). It treats a *word* as a space-delimited tuple of symbols terminated by `</w>`, matching the paper's convention for marking word boundaries.
+The reference implementation below follows the BPE training loop from Sennrich et al. 2016 (§3.2). One deliberate departure from the paper: each word is represented as a tuple of character symbols with `</w>` fused onto the **last character** (`"hello"` → `("h","e","l","l","o</w>")`) rather than carrying `</w>` as a standalone symbol. This is what Hugging Face `tokenizers` does when `end_of_word_suffix` is set, so matching HF requires the same initial symbol inventory on both sides — otherwise pair statistics diverge by construction even on identical input.
 
 ```python
 # bpe_from_scratch.py
@@ -29,11 +29,16 @@ END = "</w>"
 
 
 def _word_tuples(corpus: Iterable[str]) -> Counter:
-    """Count whitespace-split words, each represented as a tuple of chars + end marker."""
+    """Count whitespace-split words. `END` is fused onto the last character so the
+    initial symbol inventory matches HF's `end_of_word_suffix` behaviour."""
     counts: Counter = Counter()
     for line in corpus:
         for word in line.split():
-            counts[tuple(word) + (END,)] += 1
+            if not word:
+                continue
+            chars = list(word)
+            chars[-1] = chars[-1] + END
+            counts[tuple(chars)] += 1
     return counts
 
 
@@ -81,7 +86,10 @@ def encode(text: str, merges: list[tuple[str, str]]) -> list[str]:
     rank = {pair: i for i, pair in enumerate(merges)}
     out: list[str] = []
     for word in text.split():
-        symbols = list(word) + [END]
+        if not word:
+            continue
+        symbols = list(word)
+        symbols[-1] = symbols[-1] + END
         while True:
             best_i, best_rank = -1, len(rank)
             for i in range(len(symbols) - 1):
@@ -132,7 +140,7 @@ def train_hf_bpe(corpus_path: str, vocab_size: int) -> Tokenizer:
 Two parity knobs make this comparison honest, and both must be set:
 
 - `WhitespaceSplit` (not `Whitespace`) matches the scratch implementation's `line.split()` exactly — it splits on whitespace only. `Whitespace` additionally splits on punctuation, which would peel `.`/`,`/`?` off words before merges are counted and make the HF symbol inventory diverge from the scratch one on even plain ASCII input.
-- `end_of_word_suffix="</w>"` on *both* the `BPE` model and the `BpeTrainer`. The scratch implementation appends `</w>` to every training word and allows merges involving the marker; without the matching suffix on the HF side, the two trainers accumulate pair statistics over different symbol inventories and the merge lists cannot be compared.
+- `end_of_word_suffix="</w>"` on *both* the `BPE` model and the `BpeTrainer`. HF attaches this suffix to the last character of each word before training starts (`"hello"` → `["h", "e", "l", "l", "o</w>"]`), and §2.1's scratch implementation fuses `</w>` onto the last character for exactly the same reason — identical initial symbol inventories on both sides. If either side skips the suffix, or if one side carries `</w>` as a standalone symbol while the other attaches it, pair statistics diverge on the very first count and the merge lists stop being comparable.
 
 Pick `ByteLevel` pre-tokenisation if you want GPT-2-style byte BPE instead — then drop the `end_of_word_suffix` on both sides, and switch the from-scratch implementation's alphabet to the 256-entry byte→unicode map that `tokenizers` uses (see `tokenizers.pre_tokenizers.ByteLevel.alphabet()`).
 
@@ -178,7 +186,7 @@ A worked expectation for the written-up answer: report (a) merge-list Jaccard, (
 
 ## 3. Validation steps
 
-1. **Unit-test the merge loop on a toy corpus** — the paper's `low lower newest widest` example should produce the merges `(e, s), (es, t), (l, o)…` in that order; a correct implementation reproduces this.
+1. **Unit-test the merge loop on a toy corpus** — on the paper's `low lower newest widest` example, after two merges both `newest` and `widest` should contain `est</w>` as a single piece. The paper's §3.2 lists the operations as `(e, s), (es, t), (est, ·)` with `</w>` standalone; our attached-marker representation (matching HF) collapses the paper's last two merges into one, so the piece is reached in one fewer step but the outcome is the same. Which of the freq-9 pairs `(e, s)` or `(s, t</w>)` wins the first merge depends on the tiebreak — the §2.1 implementation picks the lex-largest, so `(s, t</w>)` goes first and `(e, st</w>)` second.
 2. **Round-trip test** — `"".join(encode(x, merges)).replace(END, " ").rstrip()` should equal `" ".join(x.split())` for any whitespace-tokenised input. Join the pieces *without* spaces (they are subword pieces, not words), then let the end-of-word marker reconstitute the single inter-word space; `rstrip` drops the trailing space from the final word's marker. Joining with `" "` instead inserts whitespace *inside* words and will fail on even trivial inputs — e.g. after two merges on `"hello world"`, the pieces might be `["h", "e", "l", "l", "o</w>", "wor", "l", "d</w>"]`, so the space-join expression produces `"h e l l o   wor l d  "` rather than `"hello world"`.
 3. **Determinism test** — train twice with the same seed and corpus, assert identical merge lists.
 4. **Vocab-size parity** — confirm that `len(set(merges))` plus the initial alphabet plus specials equals the `vocab_size` you asked `BpeTrainer` for. If not, your parity math (§2.3) is off.
