@@ -1,323 +1,228 @@
 # exercise-01 — BPE From Scratch and Against Hugging Face `tokenizers`
 
+> Reference solution. The exercise brief lives in the paired `nlp-engineer-learning` repo at
+> `lessons/mod-101-tokenization-and-text-foundations/exercises/exercise-01-bpe-from-scratch-and-against-hf-tokenizers.md`.
+> This solution targets the learning goals that filename implies: implement byte-pair encoding end-to-end, train it on a small corpus, and compare the learned vocabulary and segmentations against a Hugging Face `tokenizers`-trained BPE on the same corpus.
+
 ## 1. Solution overview
 
-The exercise asks learners to (a) implement byte-pair encoding (BPE) from
-scratch on a small corpus, (b) train a comparable Hugging Face `tokenizers`
-BPE model on the same corpus, and (c) analyse differences in the learned
-merge table and the resulting token sequences.
+The exercise exercises three ideas at once:
 
-The reference solution has three artifacts:
+1. **The BPE training loop** (Sennrich, Haddow, Birch 2016) — initialise a symbol vocabulary as characters, repeatedly merge the most frequent adjacent symbol pair, and record the merge list. Stop at a target vocabulary size.
+2. **Deterministic, reproducible encoding** — given the merge list, segment a new string by applying merges in the order they were learned. This separation between *training* (statistics over a corpus) and *encoding* (rule application over one string) is the mental model to anchor on.
+3. **Compatibility with a production library** — `tokenizers` (Hugging Face) ships a `BPE` model plus a `BpeTrainer`. A faithful from-scratch implementation should produce the same merges on the same input, modulo pre-tokenisation and byte-vs-char alphabet choices (GPT-2-style byte BPE uses a 256-entry byte alphabet rather than raw Unicode characters).
 
-1. `bpe_from_scratch.py` — a self-contained trainer and encoder that follows
-   Sennrich, Haddow and Birch (2016) "Neural Machine Translation of Rare
-   Words with Subword Units" (ACL 2016 / arXiv:1508.07909). It operates on
-   pre-tokenised word counts and learns a merge list by greedy frequency.
-2. `train_hf_bpe.py` — a Hugging Face `tokenizers` recipe that trains
-   `BpeTrainer` on the same corpus with explicit pre-tokeniser,
-   normaliser, and decoder settings so that the comparison is apples to
-   apples.
-3. `compare.py` — loads both tokenizers, encodes a shared probe set
-   (English prose, a non-ASCII paragraph, a URL, and an uncommon
-   identifier), and prints merge-order diffs and token-sequence diffs.
+The deliverable is: a short Python module with a training function and an encoding function, a comparison harness that trains both tokenizers on the same corpus, and a written analysis of any differences (vocab overlap, token count on a held-out sample, longest divergent sequence).
 
-Scope deliberately avoids byte-level BPE (covered in exercise-02's
-unigram/WordPiece pairing and in GPT-family notes in exercise-05). The
-solution uses character-level BPE so students can read the merges by eye.
+## 2. Worked answer / implementation
 
-## 2. Worked answer or implementation
+### 2.1 Minimal BPE in pure Python
 
-### 2.1 Minimal from-scratch BPE
+The reference implementation below follows the BPE training loop from Sennrich et al. 2016 (§3.2). One deliberate departure from the paper: each word is represented as a tuple of character symbols with `</w>` fused onto the **last character** (`"hello"` → `("h","e","l","l","o</w>")`) rather than carrying `</w>` as a standalone symbol. This is what Hugging Face `tokenizers` does when `end_of_word_suffix` is set, so matching HF requires the same initial symbol inventory on both sides — otherwise pair statistics diverge by construction even on identical input.
 
 ```python
 # bpe_from_scratch.py
-"""Minimal character-level BPE, following Sennrich, Haddow & Birch (2016).
-
-The trainer operates over a word-count dictionary. Each word is stored as a
-tuple of characters with an end-of-word marker ``</w>`` so that merges at
-word boundaries stay bounded.
-"""
-from __future__ import annotations
-
-import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from typing import Iterable
 
+END = "</w>"
 
-END_OF_WORD = "</w>"
 
-
-def word_counts(corpus: Iterable[str]) -> Counter[str]:
-    """Lowercase, split on whitespace, count words. Keep punctuation attached
-    so that learners can see how punctuation-adjacent merges emerge."""
-    counts: Counter[str] = Counter()
+def _word_tuples(corpus: Iterable[str]) -> Counter:
+    """Count whitespace-split words. `END` is fused onto the last character so the
+    initial symbol inventory matches HF's `end_of_word_suffix` behaviour."""
+    counts: Counter = Counter()
     for line in corpus:
-        for word in line.strip().split():
-            if word:
-                counts[word] += 1
+        for word in line.split():
+            if not word:
+                continue
+            chars = list(word)
+            chars[-1] = chars[-1] + END
+            counts[tuple(chars)] += 1
     return counts
 
 
-def initial_vocab(counts: Counter[str]) -> dict[tuple[str, ...], int]:
-    """Represent each word as a tuple of symbols with an end-of-word marker."""
-    return {tuple(word) + (END_OF_WORD,): freq for word, freq in counts.items()}
+def _pair_stats(vocab: Counter) -> Counter:
+    pairs: Counter = Counter()
+    for word, freq in vocab.items():
+        for a, b in zip(word, word[1:]):
+            pairs[(a, b)] += freq
+    return pairs
 
 
-def pair_stats(vocab: dict[tuple[str, ...], int]) -> Counter[tuple[str, str]]:
-    stats: Counter[tuple[str, str]] = Counter()
-    for symbols, freq in vocab.items():
-        for a, b in zip(symbols, symbols[1:]):
-            stats[(a, b)] += freq
-    return stats
-
-
-def merge_vocab(
-    pair: tuple[str, str], vocab: dict[tuple[str, ...], int]
-) -> dict[tuple[str, ...], int]:
-    merged: dict[tuple[str, ...], int] = {}
-    joined = pair[0] + pair[1]
-    for symbols, freq in vocab.items():
-        new_symbols: list[str] = []
-        i = 0
-        while i < len(symbols):
-            if (
-                i < len(symbols) - 1
-                and symbols[i] == pair[0]
-                and symbols[i + 1] == pair[1]
-            ):
-                new_symbols.append(joined)
+def _merge(vocab: Counter, pair: tuple[str, str]) -> Counter:
+    merged = Counter()
+    a, b = pair
+    ab = a + b
+    for word, freq in vocab.items():
+        new_word, i = [], 0
+        while i < len(word):
+            if i < len(word) - 1 and word[i] == a and word[i + 1] == b:
+                new_word.append(ab)
                 i += 2
             else:
-                new_symbols.append(symbols[i])
+                new_word.append(word[i])
                 i += 1
-        merged[tuple(new_symbols)] = merged.get(tuple(new_symbols), 0) + freq
+        merged[tuple(new_word)] = freq
     return merged
 
 
-@dataclass
-class BPEModel:
-    merges: list[tuple[str, str]]
-    vocab: set[str]
-
-    def encode_word(self, word: str) -> list[str]:
-        symbols = list(word) + [END_OF_WORD]
-        rank = {pair: i for i, pair in enumerate(self.merges)}
-        while True:
-            pairs = list(zip(symbols, symbols[1:]))
-            if not pairs:
-                break
-            candidate = min(pairs, key=lambda p: rank.get(p, float("inf")))
-            if candidate not in rank:
-                break
-            # apply the earliest-merged pair once (left-to-right).
-            new_symbols: list[str] = []
-            i = 0
-            while i < len(symbols):
-                if (
-                    i < len(symbols) - 1
-                    and (symbols[i], symbols[i + 1]) == candidate
-                ):
-                    new_symbols.append(symbols[i] + symbols[i + 1])
-                    i += 2
-                else:
-                    new_symbols.append(symbols[i])
-                    i += 1
-            symbols = new_symbols
-        return symbols
-
-
-def train_bpe(corpus: Iterable[str], num_merges: int) -> BPEModel:
-    vocab = initial_vocab(word_counts(corpus))
+def train_bpe(corpus: Iterable[str], num_merges: int):
+    """Return (merges, final_vocab). `merges` is an ordered list of pairs."""
+    vocab = _word_tuples(corpus)
     merges: list[tuple[str, str]] = []
     for _ in range(num_merges):
-        stats = pair_stats(vocab)
+        stats = _pair_stats(vocab)
         if not stats:
             break
-        best = max(stats, key=stats.get)
-        if stats[best] < 2:  # no further compressive merges available
-            break
-        vocab = merge_vocab(best, vocab)
+        best = max(stats, key=lambda p: (stats[p], p))  # deterministic tiebreak
         merges.append(best)
-    tokens: set[str] = set()
-    for symbols in vocab:
-        tokens.update(symbols)
-    return BPEModel(merges=merges, vocab=tokens)
+        vocab = _merge(vocab, best)
+    return merges, vocab
 
 
-if __name__ == "__main__":
-    import sys
-
-    text = sys.stdin.read().splitlines()
-    model = train_bpe(text, num_merges=200)
-    for i, (a, b) in enumerate(model.merges):
-        print(f"{i:03d}\t{a}\t{b}")
+def encode(text: str, merges: list[tuple[str, str]]) -> list[str]:
+    """Apply learned merges to a new string, in order."""
+    rank = {pair: i for i, pair in enumerate(merges)}
+    out: list[str] = []
+    for word in text.split():
+        if not word:
+            continue
+        symbols = list(word)
+        symbols[-1] = symbols[-1] + END
+        while True:
+            best_i, best_rank = -1, len(rank)
+            for i in range(len(symbols) - 1):
+                r = rank.get((symbols[i], symbols[i + 1]), len(rank))
+                if r < best_rank:
+                    best_rank, best_i = r, i
+            if best_i < 0:
+                break
+            symbols = (
+                symbols[:best_i]
+                + [symbols[best_i] + symbols[best_i + 1]]
+                + symbols[best_i + 2 :]
+            )
+        out.extend(symbols)
+    return out
 ```
 
-### 2.2 Equivalent Hugging Face training recipe
+Two deliberate choices worth calling out to a learner:
+
+- **Deterministic tiebreak.** When two pairs are tied in frequency, sorting on `(freq, pair)` gives reproducible merges across runs. Without it, Python dict iteration order can leak non-determinism into the merge list.
+- **Encoding picks the earliest learned merge each step.** That is how production BPE ranks pairs: merges earlier in the list win. This matches the BPE inference loop that libraries like `tokenizers` and `tiktoken` implement.
+
+### 2.2 Training the Hugging Face baseline
+
+The companion baseline uses `tokenizers` (Hugging Face's Rust-backed library). The Python API documented at <https://huggingface.co/docs/tokenizers> provides the `BPE` model and `BpeTrainer`.
 
 ```python
-# train_hf_bpe.py
-"""Train a HF `tokenizers` BPE model with settings that mirror the
-from-scratch trainer: whitespace pre-tokenisation, no byte-level fallback,
-no lowercasing beyond what the user passes in."""
-from pathlib import Path
-
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+# hf_baseline.py
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import WhitespaceSplit
 
 
-def build_tokenizer() -> Tokenizer:
-    tok = Tokenizer(models.BPE(unk_token="<unk>"))
-    tok.pre_tokenizer = pre_tokenizers.Whitespace()
-    tok.decoder = decoders.BPEDecoder()
-    return tok
-
-
-def train(corpus_path: Path, vocab_size: int = 500) -> Tokenizer:
-    tok = build_tokenizer()
-    trainer = trainers.BpeTrainer(
+def train_hf_bpe(corpus_path: str, vocab_size: int) -> Tokenizer:
+    tok = Tokenizer(BPE(unk_token="[UNK]", end_of_word_suffix="</w>"))
+    tok.pre_tokenizer = WhitespaceSplit()
+    trainer = BpeTrainer(
         vocab_size=vocab_size,
-        special_tokens=["<unk>", "<s>", "</s>", "<pad>"],
+        special_tokens=["[UNK]"],
+        end_of_word_suffix="</w>",
         show_progress=False,
-        min_frequency=2,
     )
-    tok.train(files=[str(corpus_path)], trainer=trainer)
+    tok.train([corpus_path], trainer)
     return tok
-
-
-if __name__ == "__main__":
-    import sys
-
-    tok = train(Path(sys.argv[1]))
-    tok.save("hf_bpe.json")
 ```
 
-### 2.3 Comparison probes
+Two parity knobs make this comparison honest, and both must be set:
+
+- `WhitespaceSplit` (not `Whitespace`) matches the scratch implementation's `line.split()` exactly — it splits on whitespace only. `Whitespace` additionally splits on punctuation, which would peel `.`/`,`/`?` off words before merges are counted and make the HF symbol inventory diverge from the scratch one on even plain ASCII input.
+- `end_of_word_suffix="</w>"` on *both* the `BPE` model and the `BpeTrainer`. HF attaches this suffix to the last character of each word before training starts (`"hello"` → `["h", "e", "l", "l", "o</w>"]`), and §2.1's scratch implementation fuses `</w>` onto the last character for exactly the same reason — identical initial symbol inventories on both sides. If either side skips the suffix, or if one side carries `</w>` as a standalone symbol while the other attaches it, pair statistics diverge on the very first count and the merge lists stop being comparable.
+
+Pick `ByteLevel` pre-tokenisation if you want GPT-2-style byte BPE instead — then drop the `end_of_word_suffix` on both sides, and switch the from-scratch implementation's alphabet to the 256-entry byte→unicode map that `tokenizers` uses (see `tokenizers.pre_tokenizers.ByteLevel.alphabet()`).
+
+### 2.3 Comparison harness
 
 ```python
 # compare.py
-from pathlib import Path
-
-from tokenizers import Tokenizer
-
-import bpe_from_scratch as scratch
+from bpe_from_scratch import train_bpe, encode
+from hf_baseline import train_hf_bpe
 
 
-PROBES = [
-    "the quick brown fox jumped over the lazy dog",
-    "naïve café résumé",            # NFC + diacritics
-    "https://example.com/path?x=1",  # URL-like
-    "tokeniser tokenizer tokenization",  # morphological family
-]
+def load_corpus(path: str) -> list[str]:
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
-def main(corpus: Path) -> None:
-    scratch_model = scratch.train_bpe(corpus.read_text().splitlines(), 200)
-    hf_model = Tokenizer.from_file("hf_bpe.json")
-    for probe in PROBES:
-        scratch_tokens = [
-            tok for word in probe.split() for tok in scratch_model.encode_word(word)
-        ]
-        hf_tokens = hf_model.encode(probe).tokens
-        print(probe)
-        print("  scratch:", scratch_tokens)
-        print("  hf     :", hf_tokens)
+def compare(corpus_path: str, num_merges: int, sample_lines: list[str]):
+    corpus = load_corpus(corpus_path)
 
+    # From-scratch
+    merges, _ = train_bpe(corpus, num_merges)
+    scratch_tokens = [encode(line, merges) for line in sample_lines]
 
-if __name__ == "__main__":
-    import sys
+    # HF baseline — vocab_size includes initial alphabet and specials,
+    # so pass num_merges + alphabet_size + len(specials) for parity.
+    initial_alphabet = sorted({c for line in corpus for c in line})
+    hf_vocab_size = num_merges + len(initial_alphabet) + 1  # +1 for [UNK]
+    hf = train_hf_bpe(corpus_path, hf_vocab_size)
+    hf_tokens = [hf.encode(line).tokens for line in sample_lines]
 
-    main(Path(sys.argv[1]))
+    for line, s, h in zip(sample_lines, scratch_tokens, hf_tokens):
+        print(line)
+        print("  scratch:", s)
+        print("  hf     :", h)
+        print("  len diff:", len(s) - len(h))
 ```
 
-### 2.4 What the comparison should reveal
+### 2.4 Expected result
 
-- **Merge order differs for ties.** The 2016 BPE paper does not specify
-  tie-breaking; the reference implementation uses `Counter.max`, which
-  returns insertion order. HF `tokenizers` defines its own deterministic
-  rule. Ties on small corpora can therefore permute merges 1–20 even when
-  the frequency counts are identical.
-- **End-of-word handling.** The from-scratch model uses an explicit
-  `</w>` marker; HF's `BPE` model stores whether a token is word-initial
-  via its serialised form instead. Learners should note the `Ġ`-style
-  prefix is only introduced by `ByteLevel` pre-tokenisation, not by the
-  `Whitespace` pre-tokeniser used here.
-- **Non-ASCII input.** On `naïve`, the from-scratch trainer learns merges
-  over Unicode scalar values; HF does the same under `Whitespace`. Byte-
-  level BPE (e.g. GPT-2) would instead operate on UTF-8 bytes — covered as
-  a stretch bullet rather than in the main solution.
+On a small clean corpus (a few thousand lines of ASCII English, whitespace pre-tokenisation on both sides, matching alphabet), the two tokenisers typically land within a few percent on token count per sentence, and the top merges (shortest, highest-frequency) agree verbatim. Divergence grows at the tail of the merge list where ties are broken differently, and anywhere the pre-tokeniser disagrees (punctuation handling, leading-space markers, byte vs. char alphabet).
+
+A worked expectation for the written-up answer: report (a) merge-list Jaccard, (b) mean tokens-per-sentence on a held-out slice, (c) one or two concrete divergent sequences with a plausible explanation. See §5 for common traps.
 
 ## 3. Validation steps
 
-1. **Deterministic on a fixed corpus.** Running `bpe_from_scratch.py` twice
-   on the same input must produce byte-identical merge lists. The trainer
-   has no randomness, so a diff should be empty.
-2. **Round-trip encode → decode.** For HF, `tok.decode(tok.encode(s).ids)`
-   on each probe must equal `s` after whitespace normalisation. The HF
-   `BPEDecoder` reconstructs words by concatenating sub-tokens; verify the
-   output matches the pre-tokeniser's view, not the raw string with
-   collapsed spaces.
-3. **Compression check.** On the training corpus, `len(tokens) /
-   len(words)` should decrease monotonically as `num_merges` grows, up to
-   the point where the merge table saturates the vocabulary. Plot this to
-   confirm the trainer is making progress.
-4. **Behavioural parity test.** Pick a word that appears many times in the
-   corpus. After enough merges it should encode to a single token under
-   both tokenizers. If it does not, inspect the pre-tokeniser — the usual
-   cause is Unicode normalisation differences.
-5. **Vocabulary inclusion.** Assert that every character present in the
-   training corpus appears in `model.vocab`. Characters never covered by a
-   merge still need to live in the vocabulary as singletons, otherwise
-   encoding unseen words produces `<unk>`.
+1. **Unit-test the merge loop on a toy corpus** — on the paper's `low lower newest widest` example, after two merges both `newest` and `widest` should contain `est</w>` as a single piece. The paper's §3.2 lists the operations as `(e, s), (es, t), (est, ·)` with `</w>` standalone; our attached-marker representation (matching HF) collapses the paper's last two merges into one, so the piece is reached in one fewer step but the outcome is the same. Which of the freq-9 pairs `(e, s)` or `(s, t</w>)` wins the first merge depends on the tiebreak — the §2.1 implementation picks the lex-largest, so `(s, t</w>)` goes first and `(e, st</w>)` second.
+2. **Round-trip test** — `"".join(encode(x, merges)).replace(END, " ").rstrip()` should equal `" ".join(x.split())` for any whitespace-tokenised input. Join the pieces *without* spaces (they are subword pieces, not words), then let the end-of-word marker reconstitute the single inter-word space; `rstrip` drops the trailing space from the final word's marker. Joining with `" "` instead inserts whitespace *inside* words and will fail on even trivial inputs — e.g. after two merges on `"hello world"`, the pieces might be `["h", "e", "l", "l", "o</w>", "wor", "l", "d</w>"]`, so the space-join expression produces `"h e l l o   wor l d  "` rather than `"hello world"`.
+3. **Determinism test** — train twice with the same seed and corpus, assert identical merge lists.
+4. **Vocab-size parity** — confirm that `len(set(merges))` plus the initial alphabet plus specials equals the `vocab_size` you asked `BpeTrainer` for. If not, your parity math (§2.3) is off.
+5. **Overlap report** — compute `len(set(my_merges) & set(hf_merges)) / len(set(my_merges) | set(hf_merges))` on the first `k` merges for `k ∈ {100, 500, num_merges}`. High-k overlap is what demonstrates parity.
+6. **Divergence hunt** — run both tokenisers on a held-out paragraph; store every line where segmentations disagree; inspect the longest.
 
-## 4. Rubric or review checklist
+## 4. Rubric / review checklist
 
-| Criterion | Weight | Evidence |
-|---|---|---|
-| From-scratch trainer follows Sennrich et al. (pair counting, greedy merge) | 25% | `train_bpe` loop; merge list matches a hand-traced toy example |
-| HF trainer configured with explicit pre-tokeniser, decoder, special tokens | 15% | `build_tokenizer` block; no hidden defaults |
-| Comparison surfaces at least 2 real differences (merge order, pre-tokenisation, end-of-word marker, normaliser behaviour) | 20% | `compare.py` output discussed in write-up |
-| Round-trip and determinism tests present and passing | 15% | `pytest` or notebook assertions |
-| Discussion links algorithmic choice to downstream impact (OOV rate, sequence length, cross-lingual behaviour) | 15% | Written analysis cites corpus-specific counts, not generic claims |
-| Code readable: types, docstrings, one responsibility per function | 10% | Lint/format clean |
-
-A passing submission scores ≥70% with all "must" rows (trainer correctness,
-round-trip test) above zero. Anything that ships a non-deterministic
-trainer or silently drops characters fails regardless of total score.
+| Dimension | Pass | Partial | Fail |
+|---|---|---|---|
+| **BPE training loop** | Deterministic, correct merges on paper's toy example | Correct on toy but non-deterministic ties | Produces wrong merges or never terminates |
+| **Encoding** | Picks earliest learned merge each step; round-trips | Greedy left-to-right (common bug, wrong for BPE) | No encoder, or hard-codes training vocab |
+| **HF baseline parity** | Matches pre-tokeniser and alphabet; vocab-size math explained | Trained but parameters not explained | HF baseline ignored or copy-pasted from a tutorial |
+| **Comparison** | ≥2 quantitative metrics + ≥1 qualitative example with explanation | Quantitative only, no explanation | Just "they look the same" with no numbers |
+| **Reproducibility** | Fixed seed, pinned deps, one-command repro | Partially reproducible | Can't rerun from the writeup |
+| **Writeup** | Explains divergences in terms of pre-tokeniser / byte alphabet / tiebreak | Describes differences but not causes | No analysis |
 
 ## 5. Common mistakes
 
-- **Treating `max(stats, key=stats.get)` as stable.** On CPython it is
-  effectively insertion-ordered, but relying on that for cross-implementation
-  parity bites learners when they try to reproduce HF's merge order. The
-  fix is to tie-break on `(count, pair)` explicitly if parity is desired.
-- **Forgetting the end-of-word marker.** Without it, merges learned at
-  word boundaries bleed across words, producing a tokenizer that cannot
-  tell `er` at the end of `walker` from `er` at the start of `erase`.
-- **Running HF with `ByteLevel` pre-tokenisation and comparing to a
-  Unicode-char trainer.** The two will never match token-for-token; use
-  `Whitespace` for the apples-to-apples case and note the byte-level case
-  separately.
-- **Treating the merge list as a vocabulary.** The vocabulary is the set
-  of symbols reachable after all merges plus the base alphabet, not the
-  merge list itself.
-- **Not freezing the random seed on HF.** The HF `BpeTrainer` is
-  deterministic given a fixed corpus and settings, but shuffled input
-  files introduce apparent nondeterminism. Sort files before passing them
-  in when reproducibility matters.
+- **Greedy-left-to-right encoding.** Scanning the string left-to-right and applying the first applicable merge is not BPE — it's a different algorithm and will diverge from `tokenizers` almost immediately. BPE encoding must repeatedly pick the *lowest-rank* (earliest-learned) applicable pair across the whole word.
+- **Mismatched alphabet.** Comparing character BPE against GPT-2-style byte BPE will make the two disagree on every non-ASCII input. Pick one representation and keep both tokenisers on it.
+- **Forgotten end-of-word marker.** Without `</w>` (or the equivalent `Ġ`/space marker in byte BPE) the tokeniser cannot distinguish `er` at the end of `lower` from `er` inside `erupt`, and merges leak across word boundaries.
+- **`vocab_size` confusion.** `BpeTrainer`'s `vocab_size` counts the initial alphabet and special tokens, not just merges. If you ask for `vocab_size=1000` and your alphabet already has 96 characters, you get at most ~903 merges. Learners frequently report "my merge list is shorter than HF's" and the cause is this.
+- **Non-deterministic tiebreak.** Letting `max(stats, key=stats.get)` pick the winner on ties silently varies across Python versions. Always provide a secondary key.
+- **Over-fitting the comparison corpus.** A tiny corpus makes divergence look much larger than it will be at scale. Report on a held-out sample as well as training data.
 
 ## 6. References
 
-- Sennrich, R., Haddow, B., & Birch, A. (2016). *Neural Machine
-  Translation of Rare Words with Subword Units.* ACL 2016. arXiv:1508.07909.
-  Original BPE algorithm for NMT.
-- Hugging Face Tokenizers documentation — `models.BPE`, `BpeTrainer`,
-  `pre_tokenizers.Whitespace`, `decoders.BPEDecoder`
-  (`https://huggingface.co/docs/tokenizers`).
-- Unicode Standard Annex #29, *Unicode Text Segmentation* — background on
-  word-boundary rules that the HF `Whitespace` pre-tokeniser approximates
-  (`https://unicode.org/reports/tr29/`).
-- NIST AI Risk Management Framework (AI RMF 1.0), section on *Measure* —
-  tokenization choices contribute to the "representativeness" measurement
-  obligations when the downstream model is used in high-impact contexts
-  (`https://www.nist.gov/itl/ai-risk-management-framework`).
+Primary sources used in this solution:
+
+- Sennrich, R., Haddow, B., Birch, A. (2016). *Neural Machine Translation of Rare Words with Subword Units*. ACL. <https://aclanthology.org/P16-1162/> — introduces BPE for NMT; §3.2 contains the pseudocode this implementation follows.
+- Hugging Face `tokenizers` documentation — <https://huggingface.co/docs/tokenizers> — authoritative reference for `BPE`, `BpeTrainer`, `Whitespace`/`ByteLevel` pre-tokenisers, and the byte→unicode alphabet used by GPT-2-style tokenisers.
+- Radford, A. et al. (2019). *Language Models are Unsupervised Multitask Learners* (GPT-2 tech report) — the byte-level BPE variant. <https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf>
+
+Context references listed on the work packet (not directly load-bearing for this exercise but linked for the module context):
+
+- OWASP Machine Learning Security Top 10 — <https://owasp.org/www-project-machine-learning-security-top-10/>
+- MITRE ATLAS — <https://atlas.mitre.org/>
+- NIST AI Risk Management Framework — <https://www.nist.gov/itl/ai-risk-management-framework>

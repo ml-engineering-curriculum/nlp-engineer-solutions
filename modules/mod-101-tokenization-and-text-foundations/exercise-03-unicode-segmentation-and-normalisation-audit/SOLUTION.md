@@ -1,234 +1,160 @@
 # exercise-03 — Unicode Segmentation and Normalisation Audit
 
+> Reference solution. The exercise brief lives in the paired `nlp-engineer-learning` repo at
+> `lessons/mod-101-tokenization-and-text-foundations/exercises/exercise-03-unicode-segmentation-and-normalisation-audit.md`.
+> This solution targets the learning goals that filename implies: audit a text-processing pipeline for correct Unicode behaviour — the normalisation form applied (NFC/NFD/NFKC/NFKD), the segmentation rules used for grapheme clusters, words, and sentences (UAX #29), and the consequences when these are wrong.
+
 ## 1. Solution overview
 
-The exercise asks learners to audit a text pipeline for Unicode
-correctness: pick an input tokenizer and preprocessing stack, probe it
-with inputs that stress segmentation and normalisation, document where
-it diverges from the Unicode Standard, and recommend fixes.
+A tokeniser that does not pin its normalisation form and its segmentation algorithm is a tokeniser whose output depends on how the input was keyed in. Two visually identical strings (`"café"` as NFC vs NFD) will hash differently, split differently, and embed differently; a string that happens to contain a ZWJ or a combining mark can silently split a grapheme and poison downstream tasks (NER spans, offset mapping for QA, retrieval hit-highlighting).
 
-The reference audit uses the Hugging Face BERT WordPiece tokenizer as
-the system under test because its defaults (NFD → strip accents →
-lowercase → whitespace+punct split) exercise the full chain. The
-methodology generalises to any tokenizer.
+The audit has three parts:
 
-Audit deliverables:
+1. **Decide and pin a normalisation form.** NFC is the Unicode Consortium's default recommendation for stored text (UAX #15). NFKC additionally collapses "compatibility" variants (e.g. half-width → full-width, superscript `²` → `2`) and is appropriate for *search and matching* but destroys meaning-bearing distinctions for *display* and *downstream NLP that cares about casing/typography*. Choose one and document the trade-off.
+2. **Segment using UAX #29.** Python's stdlib `str` methods split on Python's internal notion of whitespace/alpha, not on Unicode grapheme/word boundaries. Use `regex` (with `\X` for graphemes and `\p{...}` for Unicode categories) or ICU (`PyICU.BreakIterator`) for correct behaviour. Grapheme-cluster boundaries matter whenever offsets are returned to a caller (e.g. QA span starts/ends, PII redaction).
+3. **Produce an audit report.** The deliverable lists each pipeline stage, the normalisation it applies, the segmentation it uses, and the risks it inherits.
 
-1. A **probe corpus** that covers the Unicode features the audit must
-   check (composition forms, grapheme clusters, bidi-sensitive input,
-   confusables, invisibles).
-2. An **audit script** that runs each probe through the pipeline and
-   records the outputs alongside expected Unicode-standard behaviour.
-3. A **findings table** with severity ratings and references to the
-   relevant Unicode Standard Annex (UAX) or Technical Report (UTR).
-4. A **remediation note** for each finding mapped to concrete pipeline
-   changes.
+## 2. Worked answer / implementation
 
-## 2. Worked answer or implementation
+### 2.1 Audit scope template
 
-### 2.1 Probe corpus
+For each stage of the pipeline, record the following fields. The example below is populated for a typical tokeniser-plus-BERT inference path.
 
-| ID | Input (shown as a Python literal) | What it tests | Expected per Unicode standard |
-|---|---|---|---|
-| P1 | `"café"` NFC vs `"café"` NFD | Canonical composition (UAX #15 / UTR #15) | Both forms are canonically equivalent and must tokenise identically after normalisation |
-| P2 | `"ﬀ"` (ligature `ﬀ`) | Compatibility decomposition (NFKC) | NFKC maps to `"ff"`; NFC preserves the ligature |
-| P3 | `"👨‍👩‍👧"` (ZWJ family emoji) | Extended grapheme clusters (UAX #29) | Counts as 1 user-perceived character; splitting it is a visible bug |
-| P4 | `"Café"` with turkish dotted/undotted i: `"İstanbul"` / `"istanbul"` | Locale-sensitive casing (UAX #44 and CLDR) | ASCII lowercase on `"İ"` gives `"i̇"`; Turkish casing differs |
-| P5 | `"pаypal"` with Cyrillic `а` (U+0430) | Confusables (UTS #39) | Must either be flagged or normalised; silent acceptance is a security finding |
-| P6 | Any string containing `U+200B` (ZWSP) or `U+2028` (line separator) | Invisibles and format controls (UAX #44 General_Category = Cf) | Should be stripped or normalised, not treated as word-internal characters |
-| P7 | `"‮evil.exe"` (right-to-left override) | Bidi control characters (UAX #9) | Must be stripped from untrusted input to prevent spoofing (CVE-2021-42574 family) |
-| P8 | `"straße".upper()` → `"STRASSE"` | Case folding (UAX #44 / UCD `SpecialCasing.txt`) | Default casefold doubles `ß`; round-trip lowercase does not restore it |
-
-### 2.2 Audit script
-
-```python
-# audit.py
-"""Unicode audit harness. Produces a per-probe report comparing pipeline
-output to the behaviour mandated by the Unicode Standard."""
-from __future__ import annotations
-
-import json
-import unicodedata
-from dataclasses import dataclass, asdict
-from typing import Callable
-
-try:
-    import regex  # the `regex` package implements \X (grapheme clusters)
-except ImportError:  # pragma: no cover
-    regex = None
-
-
-def count_graphemes(s: str) -> int:
-    """Count extended grapheme clusters per UAX #29. Falls back to a
-    code-point count if the `regex` library is not installed, which the
-    audit must then flag explicitly."""
-    if regex is None:
-        return len(s)
-    return len(regex.findall(r"\X", s))
-
-
-@dataclass
-class ProbeResult:
-    probe_id: str
-    input_repr: str
-    tokens: list[str]
-    token_ids: list[int]
-    grapheme_count: int
-    code_point_count: int
-    nfc_equal: bool
-    nfkc_equal: bool
-    finding: str
-
-
-def run_probe(probe_id: str, text: str, tokenize: Callable[[str], list[str]],
-              ids: Callable[[str], list[int]]) -> ProbeResult:
-    nfc = unicodedata.normalize("NFC", text)
-    nfkc = unicodedata.normalize("NFKC", text)
-    return ProbeResult(
-        probe_id=probe_id,
-        input_repr=repr(text),
-        tokens=tokenize(text),
-        token_ids=ids(text),
-        grapheme_count=count_graphemes(text),
-        code_point_count=len(text),
-        nfc_equal=(tokenize(text) == tokenize(nfc)),
-        nfkc_equal=(tokenize(text) == tokenize(nfkc)),
-        finding="",   # filled in by the auditor
-    )
-```
-
-### 2.3 Running the audit against a WordPiece tokenizer
-
-```python
-from tokenizers import Tokenizer
-
-tok = Tokenizer.from_pretrained("bert-base-uncased")
-
-def encode(s: str) -> list[str]:
-    return tok.encode(s).tokens
-
-def ids(s: str) -> list[int]:
-    return tok.encode(s).ids
-
-PROBES = {
-    "P1-nfc": "café",
-    "P1-nfd": "café",
-    "P2":     "ﬀtest",
-    "P3":     "family: \U0001F468‍\U0001F469‍\U0001F467",
-    "P4":     "İstanbul istanbul",
-    "P5":     "pаypal paypal",
-    "P6":     "foo​bar",
-    "P7":     "‮evil.exe",
-    "P8":     "straße".upper(),
-}
-
-results = [run_probe(pid, text, encode, ids) for pid, text in PROBES.items()]
-print(json.dumps([asdict(r) for r in results], ensure_ascii=False, indent=2))
-```
-
-### 2.4 Findings template
-
-| ID | Severity | Observation | Unicode source | Recommended fix |
+| Stage | Input form | Normalisation applied | Segmentation | Risks |
 |---|---|---|---|---|
-| P1 | Low (expected behaviour, but worth asserting) | NFC and NFD forms tokenise identically under `bert-base-uncased` because the tokenizer applies NFD + strip-accents. | UAX #15 | Add an explicit `unicodedata.normalize("NFC", s)` at the ingress boundary so downstream models receive a single canonical form. |
-| P2 | Medium | NFC preserves `ﬀ` as one code point; `bert-base-uncased`'s NFD + strip-accents does not decompose it, so the ligature is treated as `<unk>`. | UTR #15, section "Compatibility Equivalence" | Apply NFKC before tokenisation if downstream users are expected to paste typographically rich text. |
-| P3 | High | A ZWJ emoji family is split into component code points, which can break length-sensitive logic (SMS char limits, UI truncation). | UAX #29 | Measure length in grapheme clusters, not code points, in any user-facing surface. Do not change tokenizer input unless the downstream model was trained on grapheme-cluster-aware input. |
-| P4 | High | ASCII lowercase of `İ` yields `i` + combining dot above, splitting it across two tokens. Turkish users see different model behaviour than English users on otherwise identical inputs. | UAX #44, CLDR `SpecialCasing.txt` | Decide explicitly whether the locale-sensitive `az`/`tr` casing rules are needed. If not, document that the pipeline is locale-insensitive. |
-| P5 | High (security) | Confusable Cyrillic `а` passes through unchanged and produces a different `<unk>` or sub-token path than ASCII `a`. | UTS #39, section "Confusable Detection" | Add a confusable filter at the trust boundary for user-controlled input in fields where impersonation matters (usernames, URLs, brand text). |
-| P6 | Medium | ZWSP is preserved and becomes part of a sub-token. This leaks invisible content into logs and vector stores. | UAX #44 (`Cf` = Format) | Strip `Cf` characters at normalisation time unless the pipeline has a documented reason to keep them. |
-| P7 | Critical (security) | Bidi override is preserved. If user input is rendered in a log viewer or a web UI, this enables spoofing attacks of the same class as CVE-2021-42574 ("Trojan Source"). | UAX #9 | Reject or escape bidi controls on ingress; filtering alone is not enough for displayed text. |
-| P8 | Medium | `"straße".upper()` is `"STRASSE"`, which cannot be lowercased back to `"straße"`. Casing round-trips are lossy in general. | UAX #44, `SpecialCasing.txt` | Never assume casing is reversible. Store canonical form separately from display form. |
+| **Ingest (HTTP body)** | arbitrary UTF-8 | none | n/a | Mixed NFC/NFD from clients; invalid UTF-8; BOM |
+| **Pre-clean** | bytes → `str` | NFC (explicit) | n/a | Must choose NFC vs NFKC before this stage |
+| **Pre-tokeniser** | `str` | none (NFC already) | Unicode word boundaries (UAX #29) | Native `str.split()` misses ZWJ/ZWNJ, emoji joiners, Indic clusters |
+| **Subword tokeniser** | `str` per word | depends on model (BERT: NFD + strip accents + lowercase; GPT-2: byte-level, no normalisation) | WordPiece or byte-level BPE | Normalisation collisions (`micro µ` vs `micro m`), accent-loss for languages that need accents |
+| **Offset return** | token ids + offsets | n/a | should be *grapheme-aware* | Returning offsets on a different normalisation form than the client sent will misalign NER spans and highlights |
 
-Findings should be reported with the exact Unicode version in effect
-(e.g. 15.1.0) because character properties can shift between Unicode
-releases; the audit must be re-run when the Unicode database is
-upgraded.
+### 2.2 Reference audit script
+
+```python
+# unicode_audit.py
+import unicodedata
+import regex  # third-party; `re` does not implement UAX #29
+
+NORMAL_FORMS = ("NFC", "NFD", "NFKC", "NFKD")
+
+
+def normalise_report(s: str) -> dict:
+    """Show how a string differs across the four normal forms."""
+    return {form: unicodedata.normalize(form, s) for form in NORMAL_FORMS}
+
+
+def grapheme_clusters(s: str) -> list[str]:
+    """UAX #29 extended grapheme clusters via the `regex` module's \X."""
+    return regex.findall(r"\X", s)
+
+
+def word_tokens_uax29(s: str) -> list[str]:
+    """Approximation of UAX #29 word boundaries using Unicode properties."""
+    # \w in `regex` module respects Unicode categories (L*, N*, Mn, Pc) by default.
+    return regex.findall(r"\p{L}[\p{L}\p{M}\p{N}_‍‌]*|\p{N}+", s)
+
+
+def mixed_script_runs(s: str) -> list[tuple[str, str]]:
+    """Return (script_name, substring) runs; useful for confusable detection."""
+    out, current, current_script = [], [], None
+    for ch in s:
+        try:
+            script = unicodedata.name(ch).split(" ")[0]
+        except ValueError:
+            script = "UNKNOWN"
+        if script != current_script and current:
+            out.append((current_script, "".join(current)))
+            current = []
+        current.append(ch)
+        current_script = script
+    if current:
+        out.append((current_script, "".join(current)))
+    return out
+```
+
+### 2.3 Canonical worked example
+
+Run the audit on a short corpus that stresses every category:
+
+```python
+samples = [
+    "café",                       # 1: NFC vs NFD; 4 vs 5 code points
+    "ﬁ",                          # 2: ligature; NFKC → "fi"
+    "Ⅳ",                          # 3: Roman numeral; NFKC → "IV"
+    "👩‍🔬",                        # 4: ZWJ sequence; 1 grapheme, 3 code points
+    "नमस्ते",                      # 5: Devanagari conjunct; graphemes ≠ chars
+    "paypaΙ.com",                 # 6: Latin 'l' replaced with Greek capital iota (confusable)
+    "    Hello World",       # 7: NBSP vs regular space
+]
+```
+
+Expected observations, which the writeup should enumerate:
+
+- **(1) `"café"`.** `len(NFC) == 4`, `len(NFD) == 5` because `é` → `e` + U+0301. A tokeniser that normalises to NFC and then diffs against user input in NFD will report a false mismatch on the trailing combining mark.
+- **(2) `"ﬁ"` ligature.** NFC leaves it; NFKC turns it into `"fi"`. Matters for search ("find all 'fi'") and for any string equality check. UAX #15 is explicit that NFKC is lossy and should not be reversed.
+- **(3) `"Ⅳ"` roman numeral.** NFKC → `"IV"`. For numeric extraction this is a *gain*; for preserving the original glyph (e.g. legal document faithful rendering) it is a *loss*.
+- **(4) Emoji ZWJ sequence.** `len(str) == 3` code points (woman + U+200D ZWJ + microscope); `grapheme_clusters(s) == ["👩‍🔬"]` — one perceived character. A naive tokeniser that returns character offsets will split the woman-scientist emoji across three tokens, and offset-mapping back to the source will land mid-grapheme.
+- **(5) Devanagari `नमस्ते`.** 6 code points, 4 grapheme clusters. Any UI highlight that uses code-point offsets will highlight the wrong substring.
+- **(6) Confusable-script host.** `"paypaΙ.com"` contains a Greek capital iota where ASCII expects `l`. NFKC does *not* fix this (iota and L are different letters). The audit must flag mixed-script runs explicitly — this is the UTS #39 confusable-detection problem.
+- **(7) NBSP vs space.** Python's `str.split()` will handle U+00A0 (NBSP) as whitespace, but naive `line.split(" ")` will not. Models trained with one and served with the other show silent fertility inflation.
+
+### 2.4 Recommended pipeline defaults
+
+For a typical NLP service, the audited and documented defaults are:
+
+| Concern | Default | Rationale |
+|---|---|---|
+| Stored / canonical form | **NFC** | UAX #15 default; reversible; smallest code-point count |
+| Equality / search / dedup | **NFKC on a *copy*** | Collapses compatibility variants; keep the original around |
+| Lowercasing | `str.casefold()`, *not* `str.lower()` | Casefold handles German `ß → ss`, Turkish dotted-i, etc.; `lower()` is locale-naive |
+| Grapheme boundaries | `regex.findall(r"\X", s)` or ICU | UAX #29 compliant; code-point indexing is not safe |
+| Word boundaries | UAX #29 via `regex` or ICU; otherwise explicit pre-tokeniser | `str.split()` loses ZWJ-joined words, Indic conjuncts, CJK |
+| Mixed-script check | Flag runs where `Script_Extensions` disagrees | UTS #39; helps catch homograph attacks |
 
 ## 3. Validation steps
 
-1. **Unicode version pinned.** Record `unicodedata.unidata_version` in
-   the audit output. A finding that depends on character properties is
-   only valid against that version.
-2. **Grapheme counting verified on known inputs.** `count_graphemes`
-   should return `1` for every single-user-perceived character in the
-   probe set, including the ZWJ family. If the `regex` library is not
-   installed, the audit must explicitly flag that grapheme-level
-   findings are unverified.
-3. **Normalisation idempotence.** For every probe, verify
-   `nfc(nfc(x)) == nfc(x)` and `nfkc(nfkc(x)) == nfkc(x)`. This catches
-   corrupted combining-character sequences.
-4. **Confusable detection.** Run the P5 probe through a confusable
-   detector (`uts46` from the `idna` package, or the ICU `UnicodeSet`
-   confusable mapping). Audit passes only if the detector flags at
-   least one of the probe inputs.
-5. **Security probes re-run on every pipeline change.** P5 and P7 are
-   regression tests; they should live in the pipeline's unit-test suite
-   after the audit completes.
+1. **Round-trip the canonical form.** `assert unicodedata.normalize("NFC", unicodedata.normalize("NFC", x)) == unicodedata.normalize("NFC", x)` — normalisation is idempotent; a second pass should be a no-op.
+2. **Idempotence of the full pipeline.** `pipeline(pipeline(x)) == pipeline(x)` for representative samples. If false, you have a stage that re-normalises differently on second pass (often `lower()` interacting with Turkish locale).
+3. **Grapheme-vs-codepoint test.** `len(regex.findall(r"\X", "👩‍🔬")) == 1`, but `len("👩‍🔬") == 3` because the string is three code points (woman + ZWJ + microscope). The full first grapheme therefore has *grapheme-cluster* offsets `(0, 1)` and *code-point* offsets `(0, 3)`. If your offset-mapping returns `(0, 3)` for the first user-visible character, you are returning code-point offsets; if it returns `(0, 1)`, you are returning grapheme-cluster offsets. Document which, and ensure the choice matches what your clients expect — reversing the diagnosis sends learners off to "fix" correct offset handling.
+4. **ICU parity spot-check.** On 100 held-out multilingual lines, compare your UAX #29 word tokens against `PyICU.BreakIterator.createWordInstance(Locale("root"))`. Non-trivial divergence means your regex isn't truly UAX #29.
+5. **Mixed-script scan.** Run `mixed_script_runs` on a corpus; flag any non-trivial run that mixes Latin with Greek, Cyrillic, or Han — classic homograph pattern.
+6. **Normalisation-collision scan.** Count distinct NFC strings whose NFKC form collides; investigate the top collisions. Expected offenders: compatibility ligatures, superscript digits, full-width punctuation.
 
-## 4. Rubric or review checklist
+## 4. Rubric / review checklist
 
-| Criterion | Weight | Evidence |
-|---|---|---|
-| Probe set covers all 8 categories (composition, compatibility, grapheme cluster, locale casing, confusables, invisibles, bidi, lossy casing) | 25% | Probe table in deliverable |
-| Each finding cites the specific UAX / UTR / UTS section | 15% | Findings table has source column populated |
-| Severity ratings follow a documented rubric (impact × likelihood, or equivalent) | 10% | Rubric included in audit report |
-| Security-relevant findings (P5, P7) flagged and mapped to known CVE patterns | 15% | Written mapping (e.g. CVE-2021-42574 for Trojan Source) |
-| Remediations are concrete code-level changes, not "sanitise input" | 15% | Each finding links to a diff or a function to add |
-| Audit is reproducible: Unicode version pinned, deterministic output | 10% | README documents versions |
-| Uses `regex.\X` or ICU for grapheme clustering; does not treat `len()` as character count | 10% | Code review |
+| Dimension | Pass | Partial | Fail |
+|---|---|---|---|
+| **Normalisation decision** | Explicit choice of NFC (or NFKC on a copy) with rationale | Normalises but doesn't say which form or why | Not normalised |
+| **Segmentation** | Uses UAX #29 (regex `\X` / ICU) for graphemes and words | Uses Unicode-aware regex but not `\X` | `str.split()` only |
+| **Casefolding** | `str.casefold()` where lowercase needed; locale noted | `str.lower()` with caveat | `str.lower()` silently |
+| **Offset returns** | Documented as code-point *or* grapheme offsets; chosen to match clients | Documented but inconsistent | Off-by-grapheme on emoji / Indic |
+| **Audit report** | Stage-by-stage table + representative samples + fix list | Table only | Prose without evidence |
+| **Confusables** | Mixed-script detection present | Mentioned, not implemented | Not considered |
+| **Reproducibility** | `regex`/ICU/`unicodedata` versions pinned; Python Unicode DB version noted | Partial | None |
 
 ## 5. Common mistakes
 
-- **Using `str.lower()` and `str.upper()` without caring about locale.**
-  These apply the default (locale-independent) casing rules; they get
-  Turkish `İ` wrong, silently. If the pipeline must be locale-aware,
-  pass the locale explicitly through ICU or document the limitation.
-- **Measuring string length with `len()`.** `len("👨‍👩‍👧")` is 5 or 6
-  depending on representation, not 1. UIs that use `len()` for
-  truncation can split the grapheme cluster mid-sequence and produce
-  corrupted glyphs.
-- **Treating NFC as "the one true normalisation."** NFC is right for
-  storage and matching; NFKC is right for search and tokenization of
-  typographically rich input. The audit must state which form is used
-  at each pipeline stage.
-- **Stripping all non-ASCII.** This was common as "sanitation" and
-  still appears in legacy pipelines. It silently destroys legitimate
-  non-English input and masks the real problems the audit is looking
-  for.
-- **Ignoring `Cf` (format) characters.** ZWSP, ZWNJ, LRM, RLM, and the
-  bidi overrides are not whitespace and do not render, but they do
-  carry through to logs and embeddings.
-- **Assuming confusables only matter for domain names.** They matter
-  anywhere a decision is made on string equality: usernames, dataset
-  labels, moderation lists.
+- **Assuming code points = characters.** `len("👩‍🔬") == 4`. Any offset API that counts code points and claims to return "character offsets" will silently split emoji, flags, and Indic conjuncts.
+- **Using `str.lower()` for case-insensitive matching.** `"STRAẞE".lower() == "straße"`, but you cannot reverse it, and `"straße".lower() == "straße"` while `"STRASSE".lower() == "strasse"` — so "STRAẞE" and "STRASSE" compare unequal after lower but equal after `casefold()`. Casefold is the correct primitive.
+- **NFKC-everywhere.** Applying NFKC in the ingest path destroys information that later stages may need: ligatures, superscripts, full-width punctuation — all legitimately distinct in display. Keep the original and NFKC a *copy* for search/dedup.
+- **Ignoring BOM.** Files produced on Windows often start with a BOM (U+FEFF); left in, it becomes a visible leading token in most tokenisers. Strip explicitly in ingest.
+- **Regex `\w` under `re`, not `regex`.** Python stdlib `re`'s `\w` is Unicode-aware for letters but does not match UAX #29 word boundaries. Use the third-party `regex` module for UAX #29 semantics.
+- **Normalising inside the model's tokeniser silently.** Many pre-trained tokenisers apply their own normalisation (e.g. BERT does NFD + strip-accents). If you also normalise upstream, document that the model sees *your* output after *its* normalisation; otherwise accented inputs get stripped twice and offsets drift.
+- **Treating "visually identical" as "equal".** Confusable-script attacks (`рaypal.com` with Cyrillic `р`) survive naïve normalisation. Needs UTS #39 handling.
 
 ## 6. References
 
-- Unicode Standard Annex #15, *Unicode Normalisation Forms*
-  (`https://unicode.org/reports/tr15/`). Definitions of NFC, NFD, NFKC,
-  NFKD.
-- Unicode Standard Annex #29, *Unicode Text Segmentation*
-  (`https://unicode.org/reports/tr29/`). Grapheme cluster, word, and
-  sentence boundary rules.
-- Unicode Standard Annex #9, *Unicode Bidirectional Algorithm*
-  (`https://unicode.org/reports/tr9/`). Bidi controls and their security
-  implications.
-- Unicode Technical Standard #39, *Unicode Security Mechanisms*
-  (`https://unicode.org/reports/tr39/`). Confusable detection, mixed-
-  script detection, restricted identifier profiles.
-- Unicode Character Database, *SpecialCasing.txt*
-  (`https://unicode.org/Public/UCD/latest/ucd/SpecialCasing.txt`).
-  Context-sensitive and locale-sensitive casing.
-- CVE-2021-42574 — *Trojan Source: Invisible Vulnerabilities*. Motivates
-  P7's severity rating.
-- OWASP Machine Learning Security Top 10
-  (`https://owasp.org/www-project-machine-learning-security-top-10/`).
-  Confusables and homoglyph attacks map onto the "Input Manipulation"
-  risk category when the ML system makes decisions on text.
-- MITRE ATLAS (`https://atlas.mitre.org/`). Confusable inputs and bidi
-  spoofing fall under the techniques covered by "Craft adversarial
-  data" tactics.
-- NIST AI Risk Management Framework (AI RMF 1.0)
-  (`https://www.nist.gov/itl/ai-risk-management-framework`). The Measure
-  function calls out input-processing assumptions as a required
-  documentation artefact.
+Primary sources used in this solution:
+
+- Unicode Standard Annex #15 — *Unicode Normalization Forms*. <https://unicode.org/reports/tr15/> — defines NFC, NFD, NFKC, NFKD; recommends NFC as the canonical interchange form; states NFKC lossy.
+- Unicode Standard Annex #29 — *Unicode Text Segmentation*. <https://unicode.org/reports/tr29/> — grapheme-cluster, word, and sentence boundary rules.
+- Unicode Technical Standard #39 — *Unicode Security Mechanisms*. <https://unicode.org/reports/tr39/> — confusables and mixed-script detection.
+- Python Unicode HOWTO — <https://docs.python.org/3/howto/unicode.html> — `unicodedata`, `str.casefold()`, and caveats.
+- `regex` module documentation — <https://pypi.org/project/regex/> — `\X` for grapheme clusters, `\p{...}` for Unicode categories, Script_Extensions properties.
+- ICU User Guide — *BreakIterator* — <https://unicode-org.github.io/icu/userguide/boundaryanalysis/> — reference implementation of UAX #29.
+
+Context references listed on the work packet:
+
+- OWASP Machine Learning Security Top 10 — <https://owasp.org/www-project-machine-learning-security-top-10/> — relevant lens for homograph/input-manipulation risks at the tokeniser layer.
+- MITRE ATLAS — <https://atlas.mitre.org/> — adversarial ML techniques; confusables can appear in prompt-injection vectors.
+- NIST AI Risk Management Framework — <https://www.nist.gov/itl/ai-risk-management-framework> — Map/Measure functions call for documented data-handling decisions, of which normalisation is one.

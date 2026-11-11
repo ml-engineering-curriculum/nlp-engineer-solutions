@@ -1,361 +1,214 @@
 # exercise-04 — Domain-Adapted Tokenizer Training
 
+> Reference solution. The exercise brief lives in the paired `nlp-engineer-learning` repo at
+> `lessons/mod-101-tokenization-and-text-foundations/exercises/exercise-04-domain-adapted-tokenizer-training.md`.
+> This solution targets the learning goals that filename implies: train (or extend) a subword tokeniser so it compresses domain text more efficiently than a general-purpose off-the-shelf tokeniser, and quantify the gain.
+
 ## 1. Solution overview
 
-The exercise asks learners to train a domain-adapted tokenizer and
-decide whether to **extend** an existing tokenizer's vocabulary or
-**retrain** from scratch. The reference solution works through the
-decision explicitly, then executes both paths and evaluates them on
-domain text so that the trade-off is visible in numbers.
+A tokeniser trained on general web text (GPT-2 byte BPE, BERT WordPiece, etc.) spends many tokens per word on domain-specific vocabulary — medical terms, legal boilerplate, SQL keywords, protein sequences. Domain adaptation gets those terms into the vocabulary as single pieces, which translates directly into shorter contexts, cheaper inference, and often better downstream model performance when the embedding matrix is retrained.
 
-The worked domain is **biomedical abstracts** (a canonical case where
-general-purpose tokenizers over-fragment terminology). The methodology
-is domain-agnostic; learners should re-run the recipe on their own
-corpus.
+There are two legitimate strategies, and the exercise is to pick one deliberately and justify it:
 
-Three deliverables:
+| Strategy | What you do | Pros | Cons |
+|---|---|---|---|
+| **Train from scratch on domain corpus** | New vocabulary, new merges/pieces | Maximally efficient for the domain; clean algorithmic choice | Cannot reuse any pre-trained model weights; need to train the LM from scratch too |
+| **Extend an existing tokeniser's vocabulary** | Keep original pieces + add N domain pieces | Preserves backwards compatibility; works with existing pre-trained model if embedding matrix is resized and new rows are trained | Hybrid vocab can be suboptimal; need to handle the new embedding rows during fine-tuning |
 
-1. `train_from_scratch.py` — fresh SentencePiece Unigram on the domain
-   corpus.
-2. `extend_vocab.py` — take an existing BPE tokenizer and append
-   high-value domain tokens using the corpus's own merge statistics.
-3. `evaluate_domain.py` — measure compression and preservation of
-   multi-word technical terms against a held-out domain evaluation set.
+The deliverable is: the trained tokeniser artifact, a comparison against a baseline tokeniser on a held-out domain corpus, and a short memo documenting the choice.
 
-## 2. Worked answer or implementation
+## 2. Worked answer / implementation
 
-### 2.1 Decision rubric: extend vs. retrain
+### 2.1 Corpus preparation
 
-Use this table before training. It encodes the trade-offs that come
-from the design of subword tokenizers and the realities of downstream
-fine-tuning.
-
-| Factor | Extend an existing tokenizer | Retrain from scratch |
-|---|---|---|
-| Will the base model be fine-tuned, not retrained? | Preferred — keeps most embeddings aligned | Not an option |
-| Is domain vocabulary a small overlay (≤5k new tokens)? | Preferred | Overkill |
-| Does the domain share script and language with the base? | Required for extension to work | Still fine |
-| Is the domain mostly non-English or non-Latin script? | Risky — base merges fight the new vocabulary | Preferred |
-| Do you need deterministic token IDs for evaluation parity with the base model? | Only extension preserves the existing IDs | — |
-| Are you training a new model anyway? | — | Preferred — you have no legacy to protect |
-
-When in doubt, extension is the lower-risk default because downstream
-embeddings are the expensive artefact to replace.
-
-### 2.2 Retrain from scratch
+Quality matters more than quantity for domain adaptation. For a 32k-vocab tokeniser, 100-500 MB of in-domain text is usually enough; more helps a little, less works surprisingly well.
 
 ```python
-# train_from_scratch.py
-"""Train a domain-only SentencePiece Unigram tokenizer.
-
-The script deliberately mirrors the settings from exercise-02 so that
-differences between the general and domain models are attributable to
-training data, not hyperparameters."""
+# corpus_prep.py
+import unicodedata
 from pathlib import Path
 
-import sentencepiece as spm
+def normalise_line(line: str) -> str:
+    # Pin NFC before anyone else gets a chance to vary it (see exercise-03).
+    line = unicodedata.normalize("NFC", line.strip())
+    return line
 
-
-def train(corpus: Path, out_prefix: str, vocab_size: int = 16000) -> None:
-    spm.SentencePieceTrainer.train(
-        input=str(corpus),
-        model_prefix=out_prefix,
-        vocab_size=vocab_size,
-        model_type="unigram",
-        character_coverage=0.9995,
-        normalization_rule_name="nmt_nfkc_cf",
-        unk_id=0, bos_id=1, eos_id=2, pad_id=3,
-    )
-
-
-if __name__ == "__main__":
-    import sys
-
-    train(Path(sys.argv[1]), sys.argv[2])
+def write_corpus(src_glob: str, out_path: str) -> int:
+    n = 0
+    with open(out_path, "w", encoding="utf-8") as out:
+        for p in Path().glob(src_glob):
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    line = normalise_line(line)
+                    if line:
+                        out.write(line + "\n")
+                        n += 1
+    return n
 ```
 
-### 2.3 Extend an existing tokenizer's vocabulary
+Checklist:
+
+- Fix normalisation form (NFC) explicitly.
+- Deduplicate near-duplicate lines (minhash or just line-level `sort -u` for a small corpus).
+- Keep a disjoint ~5% held-out slice for fertility evaluation, never shown to the trainer.
+- Document the corpus provenance and licence — the trained tokeniser inherits those terms.
+
+### 2.2 Option A — Train from scratch (SentencePiece Unigram)
+
+Default choice for a new project where you also plan to train / fine-tune a model from scratch.
+
+```python
+# train_domain_scratch.py
+import sentencepiece as spm
+
+spm.SentencePieceTrainer.train(
+    input="corpus.txt",
+    model_prefix="domain_unigram_32k",
+    model_type="unigram",
+    vocab_size=32000,
+    character_coverage=0.9995,
+    normalization_rule_name="identity",   # we normalised upstream
+    user_defined_symbols=["[PAD]", "[CLS]", "[SEP]", "[MASK]"],
+    byte_fallback=True,                    # robust to unseen bytes
+    unk_surface=" ⁇ ",
+    seed_sentencepiece_size=1000000,
+)
+```
+
+`byte_fallback=True` matters: with it set, any character not in the final vocabulary falls back to byte pieces, so the tokeniser never emits `[UNK]` in practice. This is the approach used by many recent models (e.g., Llama family); it is documented in the SentencePiece repo.
+
+### 2.3 Option B — Extend an existing tokeniser
+
+Default choice when you plan to continue pre-training on top of an existing model (e.g., start from `bert-base-uncased` and keep its first-stage knowledge).
 
 ```python
 # extend_vocab.py
-"""Extend a Hugging Face BPE tokenizer with domain tokens selected from
-the corpus's own n-gram statistics.
+from collections import Counter
+from transformers import AutoTokenizer
 
-The selection heuristic is: a candidate token is valuable if it is
-*frequent* in the domain corpus and *under-represented* by the base
-tokenizer (i.e. the base splits it into many sub-tokens). This matches
-the practitioner approach used by biomedical BERT variants, which
-report adding on the order of a few thousand domain tokens on top of a
-general base.
-"""
-from __future__ import annotations
+BASE = "bert-base-uncased"
+N_NEW = 2000
 
-import collections
-import re
-from pathlib import Path
+def count_fertile_tokens(tokeniser, lines, tokens_per_word_threshold=3):
+    """Find words the base tokeniser splits into many pieces — candidates to add whole."""
+    fert: Counter = Counter()
+    for line in lines:
+        for word in line.split():
+            pieces = tokeniser.tokenize(word)
+            if len(pieces) >= tokens_per_word_threshold:
+                fert[word] += 1
+    return fert
 
-from tokenizers import Tokenizer
+base = AutoTokenizer.from_pretrained(BASE)
+with open("corpus.txt", encoding="utf-8") as f:
+    corpus_lines = [line.strip() for line in f if line.strip()]
 
-WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]+")
+candidates = count_fertile_tokens(base, corpus_lines).most_common(N_NEW * 3)
 
+# Filter: keep only words that are mostly letters and appear in multiple contexts.
+keep = [w for w, c in candidates if w.isalpha() and c >= 5][:N_NEW]
 
-def word_counts(path: Path) -> collections.Counter[str]:
-    counter: collections.Counter[str] = collections.Counter()
-    with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            counter.update(WORD_RE.findall(line))
-    return counter
-
-
-def fragmentation(tok: Tokenizer, word: str) -> int:
-    """Number of sub-tokens the base tokenizer uses for ``word``."""
-    return len(tok.encode(word, add_special_tokens=False).tokens)
-
-
-def select_additions(
-    counts: collections.Counter[str],
-    tok: Tokenizer,
-    *,
-    min_count: int = 50,
-    min_fragmentation: int = 3,
-    budget: int = 3000,
-) -> list[str]:
-    scored: list[tuple[int, str]] = []
-    for word, count in counts.items():
-        if count < min_count:
-            continue
-        frag = fragmentation(tok, word)
-        if frag < min_fragmentation:
-            continue
-        # value ≈ tokens saved per document occurrence × frequency
-        scored.append(((frag - 1) * count, word))
-    scored.sort(reverse=True)
-    return [word for _, word in scored[:budget]]
-
-
-def extend(base_tok_file: Path, corpus: Path, out_file: Path) -> list[str]:
-    tok = Tokenizer.from_file(str(base_tok_file))
-    counts = word_counts(corpus)
-    additions = select_additions(counts, tok)
-    tok.add_tokens(additions)      # appended to the end of the vocab
-    tok.save(str(out_file))
-    return additions
-
-
-if __name__ == "__main__":
-    import sys
-
-    added = extend(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
-    for word in added[:50]:
-        print(word)
-    print(f"... {len(added)} tokens added")
+added = base.add_tokens(keep)   # resizes vocab only; model.resize_token_embeddings needed downstream
+base.save_pretrained("./bert-domain-extended")
+print(f"added {added} new tokens")
 ```
 
-A few important points about extension:
+Memo should state:
 
-- `add_tokens` appends to the vocabulary without rewriting existing
-  merges or IDs, so a model that was trained against the base
-  tokenizer still produces consistent embeddings for existing IDs.
-  **New IDs need new embedding rows**; the downstream fine-tuning
-  script must resize the embedding matrix and initialise the new rows
-  (common choice: average of the sub-tokens the base used to split the
-  word into).
-- Added tokens are *whole-word* tokens; they do not participate in BPE
-  merges, so they are chosen by exact match. This means
-  capitalisation, hyphenation, and casing must match the forms seen at
-  inference.
+- Which model's weights are being carried forward.
+- Expected `model.resize_token_embeddings(len(tokenizer))` call during fine-tuning.
+- Plan for initialising the new embedding rows (random init → the model has to learn them; mean-of-constituent-pieces initialisation is the common trick).
 
-### 2.4 Domain evaluation
+### 2.4 Evaluation protocol
+
+Compute these on the held-out domain corpus against a baseline tokeniser (the general-purpose one you would have otherwise used):
+
+| Metric | Direction | Why |
+|---|---|---|
+| Mean tokens per word | lower is better for domain-adapted | Headline fertility |
+| Mean tokens per *domain-term* | lower is better | Fertility focused on target vocabulary |
+| Token count per 1 000 chars | lower is better | Compression; translates to context-window savings |
+| UNK / byte-fallback rate | should be ~0 | Sanity |
+| Coverage of a curated domain-term list | higher is better | Ensures the pieces you *care about* are single tokens |
+| Overlap with baseline vocab | descriptive | High overlap = conservative extension; low overlap = aggressive new vocab |
+
+Minimal evaluator:
 
 ```python
-# evaluate_domain.py
-from __future__ import annotations
-
-import json
-from dataclasses import dataclass
-from pathlib import Path
-
+# eval_domain.py
+from transformers import AutoTokenizer
 import sentencepiece as spm
-from tokenizers import Tokenizer
 
+def fertility(enc, lines):
+    toks = sum(len(enc(line)) for line in lines)
+    words = sum(len(line.split()) for line in lines)
+    return toks / max(words, 1)
 
-@dataclass
-class DomainMetrics:
-    name: str
-    tokens: int
-    words: int
-    kept_terms: int
-    probed_terms: int
+baseline = AutoTokenizer.from_pretrained("bert-base-uncased")
+domain = spm.SentencePieceProcessor(model_file="domain_unigram_32k.model")
 
-    def ratio(self) -> float:
-        return self.tokens / max(1, self.words)
-
-    def term_preservation(self) -> float:
-        return self.kept_terms / max(1, self.probed_terms)
-
-
-def _tokens(
-    tok_fn, word: str
-) -> list[str]:  # tok_fn returns tokens for a single word
-    return tok_fn(word)
-
-
-def eval_tokenizer(
-    name: str,
-    tok_fn,
-    eval_path: Path,
-    terms_path: Path,
-) -> DomainMetrics:
-    words_total = 0
-    tokens_total = 0
-    with eval_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            words = line.split()
-            words_total += len(words)
-            for w in words:
-                tokens_total += len(_tokens(tok_fn, w))
-
-    kept, probed = 0, 0
-    with terms_path.open(encoding="utf-8") as fh:
-        for term in fh:
-            term = term.strip()
-            if not term:
-                continue
-            probed += 1
-            if len(_tokens(tok_fn, term)) == 1:
-                kept += 1
-    return DomainMetrics(
-        name=name,
-        tokens=tokens_total,
-        words=words_total,
-        kept_terms=kept,
-        probed_terms=probed,
-    )
-
-
-def main(sp_path: Path, hf_path: Path, eval_path: Path, terms_path: Path) -> None:
-    sp = spm.SentencePieceProcessor(model_file=str(sp_path))
-    hf = Tokenizer.from_file(str(hf_path))
-    metrics = [
-        eval_tokenizer(
-            sp_path.name, lambda w: sp.encode(w, out_type=str), eval_path, terms_path
-        ),
-        eval_tokenizer(
-            hf_path.name,
-            lambda w: hf.encode(w, add_special_tokens=False).tokens,
-            eval_path,
-            terms_path,
-        ),
-    ]
-    print(json.dumps([m.__dict__ for m in metrics], indent=2))
-
-
-if __name__ == "__main__":
-    import sys
-
-    main(*[Path(p) for p in sys.argv[1:5]])
+held = open("heldout.txt", encoding="utf-8").read().splitlines()
+print("baseline fertility:", fertility(lambda s: baseline.tokenize(s), held))
+print("domain fertility  :", fertility(lambda s: domain.encode(s, out_type=str), held))
 ```
 
-### 2.5 What the comparison should show
+### 2.5 Expected result and how to report it
 
-- **Compression (tokens/word).** Domain-trained tokenizers should
-  produce fewer tokens per word on domain text. Extension partially
-  closes the gap; retraining usually closes more of it.
-- **Term preservation.** On a hand-curated list of domain terms (e.g.
-  gene names, chemical formulae, legal citations, log line signatures),
-  the domain tokenizers should encode most as single tokens. The base
-  tokenizer typically fragments them into 3–7 pieces.
-- **Carry cost for retraining.** A fresh tokenizer invalidates every
-  embedding row of the base model. If fine-tuning is the plan, the
-  cost of retraining goes up by a full epoch of embedding re-learning.
+For a typical specialised domain (e.g. biomedical abstracts, SEC filings, SQL logs), a from-scratch domain tokeniser at matched vocab size will reduce mean tokens per word by **20-50%** relative to GPT-2 byte BPE or `bert-base-uncased` WordPiece, concentrated on the terms the baseline splits into 3+ pieces. The extension strategy typically captures **60-80% of that gain** while preserving compatibility with the base model. These ranges are what writers should aim to measure empirically; concrete numbers depend on corpus and vocab size and must be reported from the actual experiment, not assumed.
 
-<!-- research-note: specific tokens-saved metrics for named biomedical
-tokenizers (e.g. BioBERT, PubMedBERT) are published in their respective
-papers but should be re-verified before quoting in a solution. -->
+The writeup should include:
+
+1. Strategy chosen (A or B) with one-paragraph justification tied to the downstream plan (train from scratch vs continue pre-training).
+2. Corpus stats: raw size, deduped size, language mix, held-out size.
+3. Vocab-size parity note (matched to baseline where possible).
+4. Full metric table.
+5. Five to ten qualitative segmentation examples of domain terms, side by side.
+6. A limitations paragraph (overfitting to corpus style, data provenance, licence inheritance, how the added embeddings will be initialised downstream).
 
 ## 3. Validation steps
 
-1. **Corpus hygiene.** Deduplicate the training corpus (even near-
-   duplicates matter — SentencePiece's Unigram objective is sensitive
-   to repetition). Record corpus size in characters and words in the
-   README.
-2. **Train/eval split.** The evaluation corpus must come from a source
-   or time period not seen in training. Otherwise the compression
-   measurement is overly optimistic.
-3. **Term list independence.** The curated term list used for the
-   `term_preservation` metric must be sourced *before* training (e.g.
-   from an external ontology) so the metric is not a proxy for the
-   training data itself.
-4. **Embedding init sanity (for extension).** After adding tokens,
-   train a tiny model head for a few hundred steps and confirm the new
-   token embeddings move. If they stay at the init value, the
-   embedding resize wiring is broken.
-5. **Backwards compatibility (for extension).** Encode a probe set of
-   general-purpose sentences with the extended tokenizer and the base
-   tokenizer; the token ID sequences for tokens that already existed
-   must match.
-6. **Reproducibility.** Record the tokenizer trainer version, the
-   corpus checksum, and the seed. Unigram is deterministic given
-   those; BPE extensions are deterministic given sort order.
+1. **Round-trip test.** `decode(encode(x)) == x` modulo documented whitespace normalisation on 1 000 held-out lines.
+2. **Byte-fallback safety.** For SP Unigram with `byte_fallback`, the UNK rate on held-out data must be effectively zero. If not, investigate — a non-zero UNK means something in the encoder path is bypassing fallback.
+3. **Vocab-size parity.** `len(baseline.vocab) == len(domain.vocab)` within specials. Otherwise fertility differences include a size effect.
+4. **Fertility diff significance.** Bootstrap the mean fertility over held-out lines; report a 95% CI. Domain tokeniser's CI should not overlap baseline's.
+5. **Downstream compatibility check (Option B only).** Instantiate the base model, call `model.resize_token_embeddings(len(tokeniser))`, run one forward pass on a domain sample — no shape errors, finite logits.
+6. **Determinism.** Fixed seed and fixed input ordering yield byte-identical model files (`sha256sum`).
 
-## 4. Rubric or review checklist
+## 4. Rubric / review checklist
 
-| Criterion | Weight | Evidence |
-|---|---|---|
-| Learner states the extend-vs-retrain decision with rationale before training | 15% | Written decision section |
-| Both options implemented with matched vocabulary budget (or budgets reported) | 20% | Scripts committed, parameters documented |
-| Domain evaluation uses an externally sourced term list | 15% | README cites the term source |
-| Results reported for compression and term preservation, not just one | 15% | Evaluation output |
-| Discussion of downstream cost (embedding init, retraining, inference cache invalidation) | 15% | Written analysis |
-| Reproducibility artefacts: corpus checksum, seed, trainer version | 10% | README |
-| Acknowledges limitations (term list bias, corpus leakage, locale assumptions) | 10% | Written limitations section |
+| Dimension | Pass | Partial | Fail |
+|---|---|---|---|
+| **Strategy choice** | Option A or B picked, justified against downstream plan | Picked but not justified | Both tried, neither evaluated |
+| **Corpus hygiene** | NFC fixed, dedup, held-out slice disjoint, provenance documented | 2 of 4 | Trained on raw mixed data |
+| **Fair comparison** | Matched vocab size; baseline named and pinned | Baseline named only | Comparing to a different-size baseline |
+| **Metric coverage** | Fertility (word & char), UNK/fallback rate, domain-term coverage | 2 of 3 | One metric only |
+| **Qualitative evidence** | 5-10 domain-term side-by-side segmentations | 2-4 | None |
+| **Downstream compatibility (B only)** | Resize + forward pass demonstrated | Discussed only | Ignored |
+| **Limitations / risks** | Data-licence inheritance, overfitting to corpus style, embedding-init plan addressed | 1-2 of 3 | None |
+| **Reproducibility** | Fixed seed, pinned deps, one-command repro | Partial | None |
 
 ## 5. Common mistakes
 
-- **Training on raw scraped text without dedup.** SentencePiece
-  Unigram treats repeated sentences as independent evidence; a corpus
-  with heavy near-duplicates learns a vocabulary dominated by whatever
-  paragraphs happened to appear most often.
-- **Treating `add_tokens` as sufficient.** It adds the string to the
-  vocabulary but does not resize the model's embedding matrix. The
-  downstream training script must call
-  `model.resize_token_embeddings(len(tok))` (or equivalent) or new IDs
-  index into uninitialised memory.
-- **Measuring compression on in-domain training data.** Produces
-  misleadingly good numbers. Always measure on held-out domain text.
-- **Using a term list that was derived from the training corpus.**
-  Guarantees high preservation by construction. Use an external
-  ontology (UMLS, SNOMED, a legal citation style guide, Common Crawl
-  n-grams depending on domain).
-- **Forgetting that extension does not help cross-lingual coverage.**
-  If the base tokenizer never saw Arabic, no amount of adding full-
-  word tokens will give you reasonable sub-word fallback for unseen
-  Arabic words. In that case, retrain or use a multilingual base.
-- **Ignoring tokenization drift at inference.** Added tokens are
-  exact-match. If the inference-time normaliser differs from the
-  training-time normaliser, added tokens silently stop matching.
+- **Comparing against a different-size baseline.** A 50k-vocab domain tokeniser vs a 30k-vocab baseline will always "win" on fertility — but for the wrong reason. Match vocab size.
+- **Training on leaked held-out data.** If the held-out set is a random sample from the training file, fertility understates real-world token count. Hold out *lines* before training, not after.
+- **Forgetting embedding resize (Option B).** Adding tokens with `tokenizer.add_tokens()` changes the vocab size; the model's embedding matrix still has the old shape. Downstream code must call `model.resize_token_embeddings(len(tokeniser))` or inference will crash or silently point to garbage indices.
+- **New-row initialisation with random noise and then freezing.** New embedding rows initialised randomly have no useful signal; fine-tuning must actually update them. Alternatively, initialise each new row as the mean of the pieces it would have decomposed into under the old tokeniser — a well-known trick that reduces cold-start.
+- **Shipping NFKC-trained tokeniser for display-oriented tasks.** NFKC collapses ligatures, superscripts, full-width forms. If the downstream task preserves display formatting, this is lossy.
+- **Ignoring licence inheritance.** A tokeniser trained on licensed text embeds vocabulary derived from that text. Document provenance; some licences restrict derivative artefacts.
+- **Overlooking byte fallback.** Without byte fallback (or an equivalent OOV plan) the tokeniser will emit `[UNK]` on unseen characters in production — unrecoverable for the model.
 
 ## 6. References
 
-- Kudo, T. (2018). *Subword Regularization: Improving Neural Network
-  Translation Models with Multiple Subword Candidates.* ACL 2018.
-  arXiv:1804.10959.
-- Kudo, T. & Richardson, J. (2018). *SentencePiece: A simple and
-  language independent subword tokenizer and detokenizer.* EMNLP demo.
-  arXiv:1808.06226.
-- Hugging Face Tokenizers documentation — `Tokenizer.add_tokens`,
-  `Tokenizer.from_file`
-  (`https://huggingface.co/docs/tokenizers`).
-- Hugging Face Transformers documentation —
-  `PreTrainedModel.resize_token_embeddings`, which is the required
-  companion to vocabulary extension
-  (`https://huggingface.co/docs/transformers`).
-- NIST AI Risk Management Framework (AI RMF 1.0) — the Govern function
-  calls out data provenance and version tracking, which apply to
-  training corpora for tokenizers as much as for models
-  (`https://www.nist.gov/itl/ai-risk-management-framework`).
-- OWASP Machine Learning Security Top 10
-  (`https://owasp.org/www-project-machine-learning-security-top-10/`).
-  Tokenizer training corpora are part of the "Data Poisoning Attack"
-  surface; domain adaptation that pulls from untrusted sources
-  inherits this risk.
+Primary sources used in this solution:
+
+- Kudo, T. (2018). *Subword Regularization* — Unigram LM algorithm. <https://aclanthology.org/P18-1007/>
+- Kudo, T. & Richardson, J. (2018). *SentencePiece* — tokenizer + CLI; `byte_fallback`, `character_coverage`, normalisation rules. <https://aclanthology.org/D18-2012/>
+- Google SentencePiece project — training options, including `byte_fallback`. <https://github.com/google/sentencepiece>
+- Hugging Face Transformers — `tokenizer.add_tokens`, `model.resize_token_embeddings` documentation. <https://huggingface.co/docs/transformers/main_classes/tokenizer>
+- Hugging Face `tokenizers` library — <https://huggingface.co/docs/tokenizers> — WordPiece / BPE / Unigram trainers used for extension strategies.
+
+Context references listed on the work packet:
+
+- OWASP Machine Learning Security Top 10 — <https://owasp.org/www-project-machine-learning-security-top-10/> — data-provenance risks in training artefacts.
+- MITRE ATLAS — <https://atlas.mitre.org/> — adversarial manipulation of training corpora.
+- NIST AI Risk Management Framework — <https://www.nist.gov/itl/ai-risk-management-framework> — Govern/Map functions require documenting training-data provenance and derivative artefacts; a domain tokeniser is such an artefact.

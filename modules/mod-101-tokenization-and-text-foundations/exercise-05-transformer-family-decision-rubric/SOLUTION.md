@@ -1,236 +1,137 @@
 # exercise-05 — Transformer Family Decision Rubric
 
+> Reference solution. The exercise brief lives in the paired `nlp-engineer-learning` repo at
+> `lessons/mod-101-tokenization-and-text-foundations/exercises/exercise-05-transformer-family-decision-rubric.md`.
+> This solution targets the learning goals that filename implies: produce a reusable rubric for choosing among the three canonical Transformer architectures — **encoder-only**, **decoder-only**, and **encoder-decoder** — for a given NLP task, and demonstrate the rubric on worked examples.
+
 ## 1. Solution overview
 
-This is a design exercise: given a task, pick the transformer family
-(encoder-only, decoder-only, encoder–decoder) and justify the choice
-against task properties — not vibes. The reference solution delivers a
-structured rubric plus two worked examples that exercise the rubric
-end to end.
+Choosing an architecture is choosing an inductive bias about the *shape of the task*, not an opinion about which family is "best":
 
-Deliverables:
+| Family | Attention pattern | Typical pre-training | Natural tasks | Representative models |
+|---|---|---|---|---|
+| **Encoder-only** | Bidirectional; every position attends to every other | Masked LM | Classification, span extraction, representation / retrieval | BERT, RoBERTa, DeBERTa |
+| **Decoder-only** | Causal (left-to-right only) | Next-token prediction | Open-ended generation, few-shot in-context learning, instruction following | GPT family, Llama, Mistral |
+| **Encoder-decoder** | Encoder bidirectional, decoder causal with cross-attention to encoder | Denoising / seq2seq | Conditional generation where the conditioning text is substantial (translation, summarisation) | T5, BART, mT5, Flan-T5 |
 
-1. A **decision rubric** mapping task attributes to recommended family,
-   grounded in the attention patterns described by Vaswani et al.
-   (2017) and the task framing from BERT (Devlin et al., 2019), T5
-   (Raffel et al., 2020), and GPT-family papers (Radford et al.,
-   2018/2019; Brown et al., 2020).
-2. Two **worked examples** applying the rubric: (i) biomedical entity
-   extraction over fixed-length abstracts; (ii) support-ticket
-   summarisation with constrained style.
-3. A **grading rubric** instructors can apply to student submissions.
+The exercise is to convert this table into a decision rubric that handles messy real-world asks — "my team wants to do both classification and generation", "latency budget is 50 ms per request", "we have 10 k labelled examples, 0 unlabelled" — and to show it working on a handful of concrete scenarios.
 
-## 2. Worked answer or implementation
+## 2. Worked answer / implementation — the rubric
 
-### 2.1 Family primer (one paragraph each, from the primary sources)
+### 2.1 Decision flow
 
-- **Encoder-only (e.g. BERT, RoBERTa).** Bidirectional self-attention
-  over every token, trained with a masked-token objective. The entire
-  input is visible to every position, which is the ideal structure for
-  tasks where you *consume* text and emit a label, a span, or an
-  embedding (Devlin et al., 2019).
-- **Decoder-only (e.g. GPT-family, LLaMA-family).** Causal self-
-  attention: each position sees only earlier positions. Trained with
-  next-token prediction. Natural fit for *generation*, and — via
-  in-context learning and instruction tuning — also competitive on
-  consumption tasks given enough scale (Radford et al., 2018/2019;
-  Brown et al., 2020).
-- **Encoder–decoder (e.g. T5, BART).** Bidirectional encoder feeds a
-  causal decoder via cross-attention. Natural fit for *sequence-to-
-  sequence* tasks where the output is derived from the input but is
-  not an extraction of it (Vaswani et al., 2017; Raffel et al., 2020;
-  Lewis et al., 2020).
+Walk a candidate task through these questions in order. The first definitive answer wins; otherwise fall through to the tiebreaks in §2.3.
 
-### 2.2 Decision rubric
+1. **Does the task produce free-form text as output?**
+   - **No** (label, span, score, embedding) → **encoder-only** is the default.
+   - **Yes** → go to (2).
 
-Use these questions in order. Each row lists what the answer implies.
-When two rows disagree, follow the one closer to the top.
+2. **Does the output primarily depend on a long, *substantive* input text (translation, summarisation, structured QA with long context, data-to-text where the data is the conditioning signal)?**
+   - **Yes** → **encoder-decoder** is the natural fit. The bidirectional encoder gives a strong representation of the source; cross-attention gives the decoder targeted access to it.
+   - **No** (open-ended generation, chat, code, instruction following, in-context learning) → go to (3).
 
-| # | Question | Answer → family |
+3. **Is the generation open-ended, conversational, or driven by prompts rather than a specific source document?**
+   - **Yes** → **decoder-only** is the default; it is what instruction-tuned LLMs are optimised for and what the serving ecosystem assumes.
+
+### 2.2 Scoring dimensions
+
+For a quantitative rubric, score each candidate family on these axes (1 = poor fit, 5 = excellent fit). Pick the highest total; tie-break on the constraints in §2.3.
+
+| Dimension | What to assess | How to score it |
 |---|---|---|
-| 1 | Is the output a **span or label** over the input (classification, NER, QA extractive, embedding)? | Encoder-only |
-| 2 | Is the output a **free-form sequence** that is a transformation of the input (translation, summarisation, structured generation)? | Encoder–decoder (or decoder-only if scale/latency budget allows) |
-| 3 | Is the output **unconstrained open-ended text** or dialogue, with the input as a prompt rather than a source document? | Decoder-only |
-| 4 | Is the input **short and bidirectional context matters** (coreference, entity relations, arithmetic over the whole sentence)? | Prefer encoder or encoder–decoder |
-| 5 | Is the input **long, with the output derived from both halves**? | Encoder–decoder, with a long-context encoder |
-| 6 | Do you need **in-context learning / few-shot** at inference time? | Decoder-only (with scale) |
-| 7 | Are **latency and footprint** tight (edge, CPU-only, sub-20ms)? | Encoder-only, small size |
-| 8 | Are **training data labels** plentiful and task-specific? | Encoder or encoder–decoder fine-tune beats decoder-only prompting at similar sizes |
-| 9 | Do you have **no task-specific labels** but can write good instructions? | Decoder-only with instruction tuning or prompting |
-| 10 | Must the system be **auditable and reproducible** for a regulated use case? | Fine-tuned encoder or encoder–decoder is easier to pin and evaluate than a prompted decoder-only model |
+| **Task shape fit** | Does the family's inductive bias match the task? | From the flow in §2.1 |
+| **Pre-trained availability** | Is there a strong open-weights model in this family for the required language(s) and licence? | 5 if multiple SOTA options; 1 if nothing comparable |
+| **Data regime** | Supervised label volume vs. need to leverage pre-training | Encoders fine-tune well with 1k-10k labels; decoders can zero-/few-shot but fine-tuning data needs can be larger |
+| **Latency & cost** | Autoregressive generation is O(output_len) decoder calls; encoder classification is one forward pass | Favour encoder for tight-latency classification; favour small decoder with KV cache for short generation |
+| **Interpretability** | Do you need to return input-aligned spans, attributions, offsets? | Encoders make this easy; decoders make it awkward |
+| **Multilinguality / length** | Does the task need long-context or many languages? | Check existing checkpoints; context-window varies widely |
+| **Serving ecosystem** | Does your serving stack (vLLM, TGI, Triton, ONNX) support this family well? | Decoder-only has the most momentum today; encoder serving is cheap but less exciting |
 
-**Hard constraints override the rubric.** If a procurement rule
-requires a specific model family, if licencing excludes a candidate,
-or if the context window needed exceeds any available model's budget,
-the rubric only ranks the remaining options.
+### 2.3 Tie-breaks
 
-### 2.3 Worked example A — Biomedical NER on PubMed abstracts
+- **"We need both classification and generation."** Build two heads on one decoder-only model (prompt-the-label) if sample volume is low and latency tolerable, OR deploy an encoder for the classification path and a decoder for the generation path — pay the ops cost. Do *not* ship an encoder-decoder just because the Venn diagram is pleasing; it usually means two training regimes you cannot staff.
+- **"Latency ≤ 50 ms, high QPS, classification."** Encoder-only (DistilBERT / MiniLM / DeBERTa-v3-small). Decoder-only models are overkill and their generation path is wasted.
+- **"We need faithful conditional generation on long documents."** Encoder-decoder. T5 / BART / Flan-T5 carry a stronger inductive bias for faithfulness than a decoder-only model prompted the same way, and the cross-attention pattern makes abstraction vs. extraction tuning cleaner.
+- **"We want in-context learning / instruction following."** Decoder-only. The entire instruction-tuning literature (and the serving ecosystem) is built on this family.
+- **"The customer will self-host and wants smallest possible footprint."** Consider encoder-only distilled models for classification; consider small decoder-only models (3B-7B class) for generation.
 
-| Factor | Observation |
-|---|---|
-| Output shape | BIO-tagged spans over tokens (row 1 → encoder) |
-| Input length | ~250 tokens on average (short, row 4 → encoder/enc–dec) |
-| Label availability | NCBI-disease, BC5CDR provide tens of thousands of labelled abstracts (row 8 → fine-tune) |
-| Latency | Batch processing of nightly dumps, 100ms/doc acceptable |
-| Regulated? | Downstream clinical review — reproducibility matters (row 10) |
+### 2.4 Worked examples
 
-**Decision.** Encoder-only (BERT-family), fine-tuned on the domain
-with the tokenizer extended from exercise-04. Expected win: encoder
-attention directly supports the span structure, and fine-tuning on
-labelled abstracts beats few-shot prompting at the scale a clinical
-pipeline can afford to run.
+Each example walks the rubric and names a representative model class, not a specific checkpoint (which rots).
 
-**What the solution rejects and why.**
+**Example A — Toxicity classifier for user-generated comments, 50 ms SLA.**
+- Flow: free-form output? No → encoder-only.
+- Scoring: encoder-only wins on every axis; distilled encoder clinches cost and latency.
+- Decision: **encoder-only** (DeBERTa-v3-small or DistilBERT class). Fine-tune on labels; return logits.
 
-- Decoder-only with prompting: would require careful span-extraction
-  prompt engineering and post-processing, and still underperforms a
-  fine-tuned encoder on the classic biomedical NER benchmarks
-  according to their published leaderboards.
-- Encoder–decoder: works but adds parameters and latency to emit a
-  sequence that is already recoverable from token-level labels.
+**Example B — Summarise 5-page legal filings into 200-word executive summaries.**
+- Flow: free-form output? Yes → does it depend on a substantive input doc? Yes → encoder-decoder is the natural fit.
+- Scoring: encoder-decoder wins on task-shape fit and faithfulness. A decoder-only ≥7B instruction-tuned model is a credible runner-up if you need very broad generality, but at higher cost.
+- Decision: **encoder-decoder** (Flan-T5 / BART class). Alternative: decoder-only ≥7B, if the serving stack and cost allow and the summary style is best controlled by prompting.
 
-### 2.4 Worked example B — Support ticket summarisation with style constraints
+**Example C — Internal chatbot with retrieval-augmented answers.**
+- Flow: free-form output? Yes → depends on a single source doc? No, it's prompt + retrieved passages → decoder-only.
+- Scoring: decoder-only wins on instruction-following and ecosystem. Encoder-only is still useful *as the retriever* (dense bi-encoder), which is a reminder the rubric applies per-component, not per-product.
+- Decision: **decoder-only** generator + **encoder-only** retriever.
 
-| Factor | Observation |
-|---|---|
-| Output shape | Free-form summary, controlled style ("≤3 bullets, no customer names") (row 2 → enc–dec or decoder) |
-| Input length | 200–3,000 tokens per ticket thread |
-| Label availability | Limited — a few hundred human-written summaries |
-| Latency | Interactive, 1–3s acceptable |
-| Regulated? | PII must be excluded; output goes to internal users |
+**Example D — Named-entity recognition with returned character spans.**
+- Flow: free-form output? No (labels + spans) → encoder-only.
+- Scoring: encoder-only wins on interpretability (span heads sit naturally on encoder outputs). Decoder-only "generate the annotated string" works but fights the architecture.
+- Decision: **encoder-only** (BERT / DeBERTa class).
 
-**Decision.** First choice: fine-tune an encoder–decoder (BART/T5
-scale) on the labelled summaries with explicit style instructions in
-the prompt. If the labelled set is too small to converge, fall back to
-a decoder-only model with few-shot prompting and a post-hoc style
-checker.
+**Example E — Few-shot structured extraction where labels are scarce (≤100 examples) and schemas evolve weekly.**
+- Flow: free-form output? Yes (structured JSON counts as generation when schemas vary) → depends on substantive source doc? Sometimes → ambiguous.
+- Tiebreak: evolving schemas and tiny label counts favour the family that excels in-context — **decoder-only** with careful prompting and output validation. Encoder-decoder is the alternative if the input is always a single long document and the schema is stable within a weekly cycle.
+- Decision: **decoder-only** with constrained decoding or JSON-schema validation.
 
-**What the solution rejects and why.**
-
-- Encoder-only: no native way to produce free-form text.
-- Decoder-only without fine-tuning at the start: feasible but harder
-  to evaluate against a style spec; prefer fine-tuning while the
-  labelled set is the bottleneck, not the decoder choice.
-
-### 2.5 Template students can fill in
-
-```markdown
-# Decision record: <task name>
-
-## Task attributes
-- Output shape:
-- Input length (p50, p99):
-- Label availability (labelled examples, unlabelled corpus):
-- Latency and footprint budget:
-- Regulatory / audit constraints:
-- Hard constraints (licence, procurement, hardware):
-
-## Rubric walk-through
-| Rubric row | Answer | Implication |
-|---|---|---|
-| 1. | | |
-| 2. | | |
-| ... | | |
-
-## Decision
-<family, base model candidate, fine-tuning strategy>
-
-## Alternatives rejected
-<family> — why not
-
-## Review triggers
-<what signals would make us revisit this choice>
-```
+**Example F — Machine translation, EN↔ZH, published checkpoints available in both families.**
+- Flow: free-form output? Yes → depends on substantive source? Yes → encoder-decoder is the classical fit.
+- Nuance: modern decoder-only LLMs now rival or exceed classical MT systems in many pairs. Decide by *evaluation on your own test set*, not by architectural purity. Keep encoder-decoder as the default *starting point* given the stronger inductive bias for faithful conditional generation.
+- Decision: **encoder-decoder** as default; benchmark a decoder-only LLM alongside.
 
 ## 3. Validation steps
 
-The exercise is a design task; validation is review-based rather than
-test-based. The reference solution checks:
+A good rubric is not just internally consistent — it must survive contact with real cases. Validate yours by:
 
-1. **Rubric coverage.** Every row in the rubric is answered for the
-   worked examples, including "N/A" where applicable. Skipped rows
-   invalidate the walk-through.
-2. **Primary sources cited.** Each family claim ties back to a
-   canonical paper or an official project page. Vendor marketing is
-   not a primary source.
-3. **Rejections are present.** A decision without rejected
-   alternatives is a preference, not a design. The review checks that
-   at least one alternative family is explicitly considered and
-   declined.
-4. **Review triggers listed.** The decision record names the signals
-   that would cause a re-evaluation (new labelled data, context
-   window changes, latency regressions, deprecation of the base
-   model).
-5. **Risk and governance notes.** The record references NIST AI RMF
-   functions (Govern, Map, Measure, Manage) and names at least one
-   ATLAS technique or OWASP ML risk that the chosen family could be
-   exposed to.
+1. **Replay historical decisions.** Take 3-5 architecture decisions your team or the published literature has already made (e.g., "BERT for GLUE", "T5 for SuperGLUE / summarisation", "GPT-4 for instruction following") and confirm the rubric points the same way. If it disagrees, interrogate which side is wrong.
+2. **Adversarial scenarios.** Write 2-3 edge cases that intentionally stress the rubric: "classification with 2 labels but an SLA of 500 ms", "generation that must return spans", "encoder-decoder vs decoder-only for 10-page summarisation". Document how the rubric resolves them (or where it punts to measurement).
+3. **Rubric stability across reviewers.** Hand the rubric and 3 scenarios to two peers independently; disagreement on the final family answer flags under-specified axes.
+4. **Constraint-change sensitivity.** For one scenario, flip exactly one constraint (latency, labelled data, licence) and check that the rubric's answer changes in a direction that makes sense.
+5. **Document the escape hatch.** For every "default", state the measurement that would change it. (E.g., *"Default encoder-decoder for MT; switch to decoder-only if BLEU/COMET on our held-out set differ by less than one point and inference cost is lower."*)
 
-## 4. Rubric or review checklist
+## 4. Rubric / review checklist for the student's rubric
 
-| Criterion | Weight | Evidence |
-|---|---|---|
-| Rubric is applied in order and every row answered | 20% | Walk-through table completed |
-| Decision names a family, a base model class, and a training/inference strategy | 15% | Decision section |
-| At least one rejected alternative with a reason tied to task attributes | 15% | Rejections section |
-| Primary sources cited for each family claim | 10% | References section |
-| Hard constraints enumerated and respected | 10% | Constraints section |
-| Review triggers listed | 10% | Review triggers section |
-| Governance tie-in: NIST AI RMF function mapping and OWASP / ATLAS risk pointer | 10% | Risk section |
-| Worked example shows numerical or categorical task inputs, not generic prose | 10% | Task attributes section |
+| Dimension | Pass | Partial | Fail |
+|---|---|---|---|
+| **Task-shape primary axis** | Explicit yes/no question about free-form output and source-document grounding | One of the two | Not represented |
+| **Secondary axes** | At least 4 of: pre-trained availability, data regime, latency, interpretability, multilinguality, serving ecosystem | 2-3 | 0-1 |
+| **Tiebreaks** | Named for at least 3 common conflicts (classification+generation, tight latency, long-context faithfulness) | 1-2 | None |
+| **Worked examples** | ≥4 scenarios walked through, with at least one that resolves to each family | 2-3 scenarios | 0-1 |
+| **Measurement escape hatch** | For each "default", a metric that would overturn it | Mentioned only | Dogmatic |
+| **Responsible deployment context** | Mentions licence, provenance, and harm considerations for whichever family is chosen (NIST AI RMF Govern/Map; OWASP ML Top 10) | Mentioned once | Ignored |
+| **Readability** | Decision flow diagrammed or enumerated; family / model separation clear | Flow present but confusing | Prose only |
 
 ## 5. Common mistakes
 
-- **Choosing family based on familiarity.** "We use BERT for
-  everything" or "GPT can do anything" are not decisions. The rubric
-  is there to force at least one alternative to be weighed.
-- **Confusing scale with family.** A larger decoder-only model is
-  often competitive with a smaller fine-tuned encoder on consumption
-  tasks, but only at scales most teams cannot afford to serve. Decide
-  at the size and budget that will actually ship.
-- **Ignoring context window.** An encoder that can only see 512 tokens
-  is a bad fit for a task whose documents are 10k tokens, no matter
-  how good its accuracy is on short inputs. The rubric row 5 catches
-  this.
-- **Picking encoder–decoder because the task "sounds like
-  translation".** Many tasks that read like seq2seq (classification
-  into a canonical label, structured extraction) are better served by
-  an encoder that emits a structured prediction.
-- **Over-indexing on leaderboards.** Leaderboard winners are selected
-  under constraints (no latency budget, unlimited compute) that rarely
-  match deployment. The rubric puts latency/footprint explicitly in
-  the decision.
-- **No review triggers.** A decision without a "when to revisit" line
-  becomes load-bearing permanently and resists improvement.
+- **"Decoder-only can do everything, so always pick it."** It can — at a cost. For classification at scale, a 110M-parameter encoder is 10-100× cheaper per request and more interpretable. The rubric must weigh cost and SLA, not just capability.
+- **Confusing *family* with *specific model*.** The rubric picks a family. Model selection (`bert-base-uncased` vs DeBERTa-v3-base vs RoBERTa-large) is a *next-step* decision driven by language coverage, licence, and benchmarks. Mixing the two produces unreadable rubrics.
+- **Ignoring the retriever.** Many "generation" products are retrieval-augmented, which means a product uses *multiple* families (encoder bi-encoder for retrieval, decoder for generation). The rubric should apply per-component.
+- **Over-weighting trendiness.** Decoder-only LLMs dominate headlines; encoder-only models dominate everything that ships to a browser extension or a mobile device. Default to the family that fits the *task*, not the family on the latest leaderboard.
+- **No measurement escape hatch.** A rubric that never admits "run the experiment" is a philosophy, not a rubric. Every default must name the metric that would overturn it.
+- **Omitting responsible-deployment context.** Architecture choice interacts with safety and licence constraints (e.g., instruction-tuned decoder-only models inherit known jailbreak surfaces per MITRE ATLAS; data provenance for both decoder and encoder pre-training surfaces for NIST AI RMF). A rubric that does not touch these is incomplete.
 
 ## 6. References
 
-- Vaswani, A. et al. (2017). *Attention Is All You Need.* NeurIPS 2017.
-  arXiv:1706.03762. Introduces the transformer encoder, decoder, and
-  encoder–decoder.
-- Devlin, J., Chang, M.-W., Lee, K. & Toutanova, K. (2019). *BERT:
-  Pre-training of Deep Bidirectional Transformers for Language
-  Understanding.* NAACL 2019. arXiv:1810.04805. Encoder-only family.
-- Radford, A. et al. (2018). *Improving Language Understanding by
-  Generative Pre-Training.* OpenAI technical report. GPT-1.
-- Radford, A. et al. (2019). *Language Models are Unsupervised
-  Multitask Learners.* OpenAI technical report. GPT-2.
-- Brown, T. B. et al. (2020). *Language Models are Few-Shot Learners.*
-  NeurIPS 2020. arXiv:2005.14165. GPT-3 / decoder-only few-shot.
-- Raffel, C. et al. (2020). *Exploring the Limits of Transfer Learning
-  with a Unified Text-to-Text Transformer.* JMLR 21. arXiv:1910.10683.
-  T5 / encoder–decoder.
-- Lewis, M. et al. (2020). *BART: Denoising Sequence-to-Sequence
-  Pre-training for Natural Language Generation, Translation, and
-  Comprehension.* ACL 2020. arXiv:1910.13461.
-- NIST AI Risk Management Framework (AI RMF 1.0)
-  (`https://www.nist.gov/itl/ai-risk-management-framework`). Govern /
-  Map / Measure / Manage functions as the frame for the decision
-  record's risk section.
-- OWASP Machine Learning Security Top 10
-  (`https://owasp.org/www-project-machine-learning-security-top-10/`).
-  Model-selection choices shift the risk surface (e.g. prompt
-  injection on decoder-only is a different risk from adversarial
-  input on an encoder classifier).
-- MITRE ATLAS (`https://atlas.mitre.org/`). Use for mapping the
-  chosen family's exposure to adversarial ML tactics.
+Primary sources used in this solution:
+
+- Vaswani, A. et al. (2017). *Attention Is All You Need*. NeurIPS. <https://arxiv.org/abs/1706.03762> — original Transformer (encoder-decoder).
+- Devlin, J. et al. (2019). *BERT*. NAACL. <https://aclanthology.org/N19-1423/> — encoder-only, masked LM pre-training.
+- Radford, A. et al. (2019). *Language Models are Unsupervised Multitask Learners* (GPT-2). <https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf> — decoder-only, next-token pre-training.
+- Raffel, C. et al. (2020). *Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer* (T5). JMLR. <https://arxiv.org/abs/1910.10683> — encoder-decoder, text-to-text framing.
+- Lewis, M. et al. (2020). *BART: Denoising Sequence-to-Sequence Pre-training*. ACL. <https://aclanthology.org/2020.acl-main.703/> — encoder-decoder for conditional generation.
+
+Context references listed on the work packet:
+
+- OWASP Machine Learning Security Top 10 — <https://owasp.org/www-project-machine-learning-security-top-10/> — risks that vary by architecture (prompt injection on decoder-only; supply-chain and model-poisoning on any pre-trained).
+- MITRE ATLAS — <https://atlas.mitre.org/> — adversarial techniques catalogued across model families; jailbreak and prompt-injection techniques map predominantly onto decoder-only instruction-tuned deployments.
+- NIST AI Risk Management Framework — <https://www.nist.gov/itl/ai-risk-management-framework> — Govern / Map / Measure / Manage functions; architecture choice is a Map-function decision whose risks must be Measured and Managed downstream.
