@@ -2,23 +2,23 @@
 
 ML Engineering Curriculum · Level 30 · [learning](https://github.com/ml-engineering-curriculum/nlp-engineer-learning) · [solutions](https://github.com/ml-engineering-curriculum/nlp-engineer-solutions)
 
-_Generated 2026-11-03 by `aicg org completeness`._
+_Generated 2026-11-15 by `aicg org completeness`._
 
-**Overall: 50%**
+**Overall: 66%**
 
 | | Progress | Count |
 |---|---|---|
 | Learning | `██████████` 100% | 13/13 modules complete |
-| Solutions | `░░░░░░░░░░` 0% | 0/56 exercises solved |
+| Solutions | `███░░░░░░░` 32% | 18/56 exercises solved |
 
 ## Modules
 
 | Module | Status | Words | Chapters | Exercises | Quiz | Solutions |
 |---|---|---|---|---|---|---|
-| `mod-101-tokenization-and-text-foundations` | ✅ Complete | 15,423 | 8 | 5 | — | 0/5 |
-| `mod-102-classical-nlp` | ✅ Complete | 19,960 | 10 | 4 | — | 0/4 |
-| `mod-103-text-classification` | ✅ Complete | 20,150 | 8 | 4 | — | 0/4 |
-| `mod-104-sequence-labelling-and-information-extraction` | ✅ Complete | 32,092 | 13 | 5 | — | 0/5 |
+| `mod-101-tokenization-and-text-foundations` | ✅ Complete | 15,423 | 8 | 5 | — | 5/5 |
+| `mod-102-classical-nlp` | ✅ Complete | 19,960 | 10 | 4 | — | 4/4 |
+| `mod-103-text-classification` | ✅ Complete | 20,150 | 8 | 4 | — | 4/4 |
+| `mod-104-sequence-labelling-and-information-extraction` | ✅ Complete | 32,092 | 13 | 5 | — | 5/5 |
 | `mod-105-question-answering-and-machine-reading` | ✅ Complete | 20,644 | 11 | 4 | — | 0/4 |
 | `mod-106-summarisation-and-controlled-generation` | ✅ Complete | 30,289 | 13 | 5 | — | 0/5 |
 | `mod-107-machine-translation-and-multilingual-nlp` | ✅ Complete | 31,507 | 12 | 5 | — | 0/5 |
