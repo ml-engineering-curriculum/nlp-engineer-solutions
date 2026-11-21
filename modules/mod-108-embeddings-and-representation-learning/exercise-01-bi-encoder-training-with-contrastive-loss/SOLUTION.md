@@ -35,7 +35,7 @@ Reference checkpoints — pick by scale and licence:
 
 - **`sentence-transformers/all-MiniLM-L6-v2`** (Reimers et al. 2022) — 22M parameters, English, trained on a 1B-pair mixture; the canonical starter checkpoint for retrieval exercises. CPU-runnable.
 - **`sentence-transformers/all-mpnet-base-v2`** (Song et al. 2020 base + Reimers 2022 fine-tune) — 110M parameters; the strongest "free, English, general" bi-encoder in sentence-transformers before the E5 / BGE wave.
-- **`intfloat/e5-base-v2`** (Wang et al. 2022) — 110M parameters; adds a `query: ` / `passage: ` prefix convention that the model was trained with. Skipping the prefix at inference drops nDCG@10 by ~5 points.
+- **`intfloat/e5-base-v2`** (Wang et al. 2022) — 110M parameters; adds a `"query: "` / `"passage: "` prefix convention that the model was trained with. Skipping the prefix at inference drops nDCG@10 by ~5 points.
 - **`BAAI/bge-base-en-v1.5`** (Xiao et al. 2023) — 110M parameters; another strong, open-weights English bi-encoder. The **v1.5 instruction prefix** is `"Represent this sentence for searching relevant passages: "`, also required at query time.
 
 ## 2. Worked implementation
