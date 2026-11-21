@@ -100,34 +100,51 @@ def balance_pairs(
     policy: str = "sqrt",
     alpha: float = 0.5,
     seed: int = 20260101,
+    epoch_size: int | None = None,
 ) -> list[InputExample]:
     """
     policy='proportional': sample each language with weight proportional to its
                            size — lets high-resource languages dominate.
     policy='sqrt':         weight by `count^alpha` with alpha=0.5 — the NLLB
-                           convention; downweights English and other
-                           high-resource languages without zeroing them.
+                           convention; downweights high-resource languages
+                           without zeroing them.
     policy='uniform':      every language gets the same number of pairs —
                            simplest, strongest low-resource signal, wastes
                            high-resource data.
+
+    Weights are converted into **sampling probabilities**, not absolute counts.
+    `epoch_size` bounds the total number of `InputExample`s produced per epoch
+    (default: `sum(sizes.values())`). This prevents the pathological case
+    where a language with ~1k FLORES pairs is expanded to millions of examples
+    simply because `count^alpha * 100_000` happens to be a large constant.
     """
     rng = random.Random(seed)
     sizes = {lang: len(v) for lang, v in pairs_by_lang.items()}
-    if policy == "proportional":
-        weights = sizes
-    elif policy == "uniform":
+    if epoch_size is None:
+        epoch_size = sum(sizes.values())
+
+    if policy == "uniform":
         target = min(sizes.values())
         return [InputExample(texts=[a, b]) for lang in sizes
                 for (a, b) in rng.sample(pairs_by_lang[lang], target)]
+    if policy == "proportional":
+        raw = {lang: float(size) for lang, size in sizes.items()}
     else:  # sqrt
-        weights = {lang: int(size ** alpha * 100_000) for lang, size in sizes.items()}
+        raw = {lang: float(size) ** alpha for lang, size in sizes.items()}
+
+    total_w = sum(raw.values())
+    counts = {lang: max(1, int(round(w / total_w * epoch_size))) for lang, w in raw.items()}
 
     out = []
-    for lang, w in weights.items():
+    for lang, w in counts.items():
         subset = pairs_by_lang[lang]
-        if len(subset) < w:
-            subset = (subset * ((w // len(subset)) + 1))[:w]
-        out.extend(InputExample(texts=[a, b]) for a, b in subset[:w])
+        if len(subset) >= w:
+            picks = rng.sample(subset, w)
+        else:
+            # Repeat only when the requested probability exceeds available pairs.
+            # This is explicit oversampling, not an accidental 1000x blow-up.
+            picks = (subset * ((w // len(subset)) + 1))[:w]
+        out.extend(InputExample(texts=[a, b]) for a, b in picks)
     rng.shuffle(out)
     return out
 ```
@@ -136,6 +153,7 @@ Points worth defending in review:
 
 - **`sqrt` / `α=0.5` sampling is the NLLB and XLM-R default.** Pure proportional sampling trains a model that is essentially monolingual English because the parallel data is dominated by English. Uniform sampling wastes most of the available data on the saturated high-resource side.
 - **Shuffle after assembly, not before.** If you shuffle each language then interleave, in-batch negatives of exercise-01's MNRL loss happen *across* languages, which is what you want — a Spanish query's positive is then contrasted against French, German, Chinese, and Arabic negatives, teaching cross-lingual separation.
+- **`NoDuplicatesDataLoader`, not a plain shuffled `DataLoader`.** FLORES pivots each English source across all target languages, so the same English anchor appears in multiple `(eng, L)` pairs. A plain `DataLoader` would allow two such pairs into one MNRL batch, where each translation becomes a negative for an identical anchor — a sign-flipped signal. `NoDuplicatesDataLoader` guarantees each unique text appears at most once per batch.
 - **FLORES-200 is for *eval*, not for training.** Training on FLORES then reporting FLORES is contamination. For training, use CCMatrix, NLLB-mined-bitext, OPUS-100, or Tatoeba; reserve FLORES devtest for test numbers.
 
 ### 2.3 Fine-tuning from a multilingual base
@@ -144,7 +162,7 @@ Points worth defending in review:
 # train.py
 import argparse
 from sentence_transformers import SentenceTransformer, losses
-from torch.utils.data import DataLoader
+from sentence_transformers.datasets import NoDuplicatesDataLoader
 from .data import load_flores_pairs, balance_pairs
 
 
@@ -169,7 +187,14 @@ def main():
     # in practice; FLORES devtest is here for clarity but should be held out for eval.
     pairs_by_lang = load_flores_pairs(a.target_langs, split="dev")
     examples = balance_pairs(pairs_by_lang, policy=a.policy, seed=a.seed)
-    loader = DataLoader(examples, batch_size=a.batch_size, shuffle=True)
+    # `NoDuplicatesDataLoader` dedupes texts within a batch: because FLORES pivots
+    # around English, the same English anchor is reused as `(eng, spa)`,
+    # `(eng, fra)`, `(eng, zho)` positives. A plain shuffled `DataLoader` would
+    # let two such pairs land in the same batch, where MNRL would treat each
+    # translation as a negative for the other identical anchor — a sign-flipped
+    # training signal. `NoDuplicatesDataLoader` ensures each unique text appears
+    # at most once per batch.
+    loader = NoDuplicatesDataLoader(examples, batch_size=a.batch_size)
     loss = losses.MultipleNegativesRankingLoss(model=model, scale=20.0)
 
     model.fit(

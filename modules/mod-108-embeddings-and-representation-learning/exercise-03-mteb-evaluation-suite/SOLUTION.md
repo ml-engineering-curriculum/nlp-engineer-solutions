@@ -20,7 +20,7 @@ Three subtleties reliably break first-timers' numbers:
 | Failure mode | What goes wrong | How to fix |
 |---|---|---|
 | **Prefix / instruction mismatch** | E5, BGE, GTE, Instructor, and Nomic each have a *different* required prefix or instruction template. Running them bare drops task scores by 3–15 points, especially on retrieval and STS. The MTEB leaderboard numbers were produced with the prefixes in place | Encode with the model's documented prefix convention. `mteb.MTEB(..., model_prompts=...)` supports per-task prompts; the cleanest path is a thin wrapper that adds the prefix in `encode()` |
-| **Misreading the aggregate "average"** | MTEB's headline "average" score is the arithmetic mean across task categories, each normalised to its own primary metric (nDCG@10 for retrieval, Spearman for STS, accuracy for classification, V-measure for clustering). A model that is best at STS but terrible at retrieval can top one category average and still trail at aggregate | Report the **category-level breakdown** alongside the aggregate; never cite a single number without the per-category table |
+| **Misreading the aggregate "average"** | MTEB(eng, v1)'s headline "average" is the arithmetic mean over all 56 task scores (each in its own primary metric — nDCG@10 for retrieval, Spearman for STS, accuracy for classification, V-measure for clustering). It is task-weighted, so retrieval and classification dominate the aggregate. Averaging category-means instead gives small categories the same weight as retrieval and changes rankings | Report the **category-level breakdown** alongside the task-level aggregate; never cite a single number without the per-category table |
 | **Benchmark contamination** | Training on MS MARCO + NFCorpus + SciFact + QuoraRetrieval and then reporting MTEB retrieval shows the model's memorisation of those same splits, not generalisation. Several top leaderboard entries have been retracted or asterisked for this | Hold out the MTEB splits from training; if the training data includes any MTEB-listed dataset, disclose it on the model card. The leaderboard's **training-data column** exists for this reason |
 
 The deliverable is an evaluation harness with five components:
@@ -51,7 +51,7 @@ MTEB English task mix (as of mteb 1.x) — totals the headline 56 tasks:
 | **STS** | 10 | Spearman cosine | `STS12`, `STS13`, `STS14`, `STS15`, `STS16`, `STSBenchmark`, `STS17`, `STS22`, `SICK-R`, `BIOSSES` |
 | **Summarization** | 1 | Spearman | `SummEval` |
 
-The headline **aggregate** on the leaderboard is the mean of the category-wise means, not the mean of all 56 task scores. These differ when categories have different task counts — which they always do.
+The headline **aggregate** for MTEB(eng, v1) on the leaderboard is the arithmetic mean over all 56 task scores (each already normalised to its category's primary metric), not the mean of category-wise means — see Muennighoff et al. 2022, Appendix A3. The two differ because categories have different task counts (Retrieval 15 vs Summarization 1); the task-level mean weights retrieval and classification more, by design.
 
 ## 2. Worked implementation
 
@@ -87,12 +87,16 @@ class PrefixedBiEncoder:
     prefixes while leaving non-retrieval tasks unprefixed.
     """
 
-    # Prefix templates per model family. These strings are exactly what the model
-    # card recommends; using a paraphrase silently drops a few points.
+    # Prefix templates per model family. These strings are exactly what the
+    # model card recommends; using a paraphrase silently drops a few points.
+    # `symmetric` is the prefix for non-retrieval tasks (STS, classification,
+    # clustering). The E5 card FAQ explicitly prescribes `query: ` for symmetric
+    # tasks and warns that omitting it degrades performance; BGE's retrieval
+    # instruction is query-only and must NOT be applied symmetrically.
     PREFIX = {
-        "intfloat/e5": {"query": "query: ", "passage": "passage: "},
-        "BAAI/bge": {"query": "Represent this sentence for searching relevant passages: ", "passage": ""},
-        "sentence-transformers": {"query": "", "passage": ""},
+        "intfloat/e5": {"query": "query: ", "passage": "passage: ", "symmetric": "query: "},
+        "BAAI/bge": {"query": "Represent this sentence for searching relevant passages: ", "passage": "", "symmetric": ""},
+        "sentence-transformers": {"query": "", "passage": "", "symmetric": ""},
     }
 
     def __init__(self, model_id: str, device: str = "cuda"):
@@ -101,6 +105,7 @@ class PrefixedBiEncoder:
         self.family = self._detect_family(model_id)
         self.query_prefix = self.PREFIX[self.family]["query"]
         self.passage_prefix = self.PREFIX[self.family]["passage"]
+        self.symmetric_prefix = self.PREFIX[self.family]["symmetric"]
 
     @staticmethod
     def _detect_family(model_id: str) -> str:
@@ -128,15 +133,20 @@ class PrefixedBiEncoder:
 
     # --- MTEB non-retrieval hook ---
     def encode(self, sentences, batch_size: int = 64, **kwargs) -> np.ndarray:
-        # For non-retrieval tasks, the sentence-transformers default (no prefix)
-        # is what the leaderboard numbers used for E5/BGE. Do NOT add a prefix here.
+        # Non-retrieval = STS / classification / clustering / pair tasks.
+        # E5 requires `query: ` on symmetric tasks and classification/clustering
+        # features (see the model card FAQ); omitting it drops those categories
+        # by ~1-4 points. BGE's retrieval instruction is query-only — do NOT
+        # apply it here. `sentence-transformers` family stays bare.
+        if self.symmetric_prefix:
+            sentences = [self.symmetric_prefix + s for s in sentences]
         return self.model.encode(sentences, batch_size=batch_size, normalize_embeddings=True, **kwargs)
 ```
 
 Points worth defending in review:
 
 - **`encode_queries` vs `encode_corpus` vs `encode`.** MTEB inspects the model for these method names; if `encode_queries` is absent it falls back to `encode` for everything, which is how prefixes get dropped silently.
-- **Prefixes only on retrieval / reranking.** E5's `"query: "` prefix on an STS task hurts STS. The published leaderboard numbers for E5 used the prefix only on retrieval.
+- **Family-specific non-retrieval prefix.** E5's model card FAQ prescribes `"query: "` on symmetric tasks (STS, classification, clustering) as well as retrieval queries; omitting it degrades those categories by a few points. BGE is the opposite: its retrieval instruction is query-only and must stay off STS / classification / clustering. `sentence-transformers` family stays bare across the board.
 - **`normalize_embeddings=True`.** MTEB's retrieval scorer expects unit vectors (or dot-product-equivalent). Leaving it off drops retrieval nDCG by 2–5 points on cosine-trained models.
 - **Explicit family detection.** Grepping the model id is better than a config flag because you cannot forget it. If you add a new family (Nomic, Jina, Cohere, Mixedbread), add its prefix here.
 
@@ -242,9 +252,16 @@ def category_means(scores: dict) -> dict:
 
 
 def mteb_aggregate(scores: dict) -> float:
-    """The headline MTEB number: the mean of category means (NOT the mean of task scores)."""
-    cat_means = category_means(scores)
-    return statistics.mean(cat_means.values())
+    """
+    The headline MTEB(eng, v1) number: the arithmetic mean over all 56 task
+    primary-metric scores (Muennighoff et al. 2022, Appendix A3). This is
+    task-weighted, so retrieval (15 tasks) and classification (12 tasks)
+    dominate; aggregating as a mean-of-category-means instead gives small
+    categories like Summarization (1 task) the same weight as retrieval and
+    changes both aggregate scores and model rankings.
+    """
+    task_scores = [s for cat in scores.values() for s in cat.values()]
+    return statistics.mean(task_scores)
 
 
 def _extract_nested(d: dict, dotted: str):
@@ -254,7 +271,7 @@ def _extract_nested(d: dict, dotted: str):
     return cur
 ```
 
-The leaderboard's "average" column is `mean_over_categories(mean_over_tasks_in_category(primary_metric))`. Computing `mean_over_all_task_scores` instead over-weights retrieval (15 tasks) relative to pair classification (3 tasks) and will not match the leaderboard.
+The MTEB(eng, v1) leaderboard "average" column is `mean_over_all_task_scores(primary_metric)` — the arithmetic mean of all 56 task scores, task-weighted. Retrieval (15 tasks) and classification (12 tasks) therefore have more influence on the aggregate than Summarization (1 task), by design; the MTEB paper's task-imbalance discussion (Muennighoff et al. 2022, Appendix A3) states this explicitly. `category_means` is still useful to report alongside — a model can lead on retrieval and trail elsewhere — but the headline number is the task-level mean.
 
 ### 2.5 Report format — what to publish
 
@@ -275,10 +292,10 @@ runs/e5-base-v2/
 
 ## 3. Validation steps
 
-1. **Prefix-applied unit test.** On your `PrefixedBiEncoder`, assert that `encode_queries(["hello"])[0]` is *not* equal to `encode(["hello"])[0]` for an E5 / BGE family model, and that the two *are* equal for a `sentence-transformers` family model. If the first assertion fails, your retrieval tasks are running without the prefix.
+1. **Prefix-applied unit test.** On your `PrefixedBiEncoder`, assert that `encode_corpus([{"text": "hello"}])[0]` is *not* equal to `encode(["hello"])[0]` for an E5 family model (`passage: ` vs `query: `), and that `encode_queries(["hello"])[0]` is *not* equal to `encode(["hello"])[0]` for a BGE family model (retrieval instruction vs bare). For `sentence-transformers` family, all three methods must produce the same embedding. If these assertions fail, the prefix policy is being bypassed somewhere.
 2. **Fast-subset parity.** Run `FAST_SUBSET` with the published checkpoint of `intfloat/e5-base-v2` and compare each per-task score to the published number. All six should match within ±0.3 (the Spearman / nDCG rounding noise). If any is off by more than 1 point, the prefix, pooling, or normalization is wrong.
 3. **Retrieval sanity.** For `NFCorpus` specifically, nDCG@10 on `all-MiniLM-L6-v2` should land around 0.316; `e5-base-v2` around 0.372; `bge-base-en-v1.5` around 0.373 (approximate, within the model-card range). A number outside ±2 points of these flags a config bug.
-4. **Category breakdown read.** After running the English suite, write the aggregate and per-category table by hand; confirm the aggregate from §2.4 matches your `report.py` output. If the aggregate from `report.py` is *higher* than the leaderboard's for the same model, you're probably averaging over tasks instead of over categories.
+4. **Category breakdown read.** After running the English suite, write the aggregate and per-category table by hand; confirm the aggregate from §2.4 matches your `report.py` output. If your aggregate does not match the leaderboard for a known-published model, you are almost certainly averaging over category-means instead of over tasks — the MTEB(eng, v1) aggregate is the task-level mean over all 56 scores.
 5. **Training-data contamination audit.** Write a script that iterates every training `(anchor, positive)` pair and checks the (query, corpus_doc) pairs for each MTEB retrieval task; count any exact-string overlaps. The report must either say "0 overlaps" or disclose the count.
 6. **Reproducibility replay.** With `mteb` version, model revision, prefix policy, and hardware pinned, rerun the fast subset after a week; scores must match to within rounding. If they drift, something (HF Hub snapshot? torch version? `faiss` nn-backend?) is not pinned.
 7. **Runtime vs model size check.** Expect roughly linear scaling of retrieval runtime with parameter count. If `bge-large` takes *less* time than `bge-base`, batching is misconfigured.
@@ -291,7 +308,7 @@ runs/e5-base-v2/
 | **Prefix policy** | Explicit `encode_queries`/`encode_corpus`/`encode` with family-specific prefixes; unit-tested | Prefix on all encode calls | No prefixes; E5 / BGE score 5+ points below card |
 | **Benchmark version pinned** | `mteb` version + benchmark snapshot name recorded | `mteb` version only | None |
 | **Model revision pinned** | HF model id + revision hash in METADATA | Model id only | None |
-| **Correct aggregation** | Category-mean-of-means; matches leaderboard for a known model | Mean of all task scores | A single-task score called "the MTEB number" |
+| **Correct aggregation** | Task-level mean over all 56 primary-metric scores; matches leaderboard for a known model | Category-mean-of-means reported as the headline | A single-task score called "the MTEB number" |
 | **Per-category breakdown** | Reports category means and per-task scores | Aggregate only | None |
 | **Test split only** | `eval_splits=["test"]`; dev-split numbers clearly labelled "dev" when shown at all | Mix of dev and test, labelled | Dev numbers reported as MTEB numbers |
 | **Training-data disclosure** | Explicit audit; either 0-overlap claim or per-dataset disclosure | Mentioned informally | None |
@@ -302,10 +319,10 @@ runs/e5-base-v2/
 
 ## 5. Common mistakes
 
-- **Running E5 without the `"query: "` / `"passage: "` prefix.** Costs 3–8 points on retrieval and 2–4 points on STS. Diagnostic: run `MSMARCO` on `e5-base-v2` with and without; if the delta is under 1 point, the prefix is being dropped at both ends (you are comparing bare-vs-bare).
+- **Running E5 without the `"query: "` / `"passage: "` prefix.** Costs 3–8 points on retrieval and 2–4 points on STS / classification / clustering. The E5 card FAQ requires `"query: "` on symmetric and feature-extraction tasks too, not just retrieval queries. Diagnostic: run `MSMARCO` on `e5-base-v2` with and without; if the delta is under 1 point, the prefix is being dropped at both ends (you are comparing bare-vs-bare).
 - **Running BGE without the retrieval instruction.** BGE v1.5's `"Represent this sentence for searching relevant passages: "` is applied **only to the query side** for retrieval. Applying it to passages (or to STS) slightly hurts.
 - **Reporting dev MTEB numbers.** The leaderboard is test-split-only. Dev numbers are typically higher (dev is used by model authors for tuning) and not comparable.
-- **Aggregating across tasks instead of categories.** The leaderboard reports category-mean-of-means. A model with 15 retrieval wins and 3 pair-classification losses will beat on task-mean but tie on category-mean, and only the latter is the leaderboard number.
+- **Aggregating category-means instead of task scores.** The MTEB(eng, v1) leaderboard reports the task-level mean over all 56 scores. Averaging category-means gives Summarization (1 task) the same weight as Retrieval (15 tasks); your aggregate will diverge from the leaderboard and model rankings will shift. Report the per-category breakdown too, but the headline number is the task-level mean.
 - **Overfitting MTEB by training on its evaluated splits.** The leaderboard added a "Training Data" column after several models were disqualified for this. If any of MS MARCO, NQ, HotpotQA, FiQA, SciFact, NFCorpus, Quora, TREC-COVID, Touché-2020, DBPedia, CQADupStack, ArguAna, ClimateFEVER, SCIDOCS, or FEVER is in your training corpus, you must disclose it.
 - **Comparing against stale leaderboard snapshots.** The MTEB leaderboard rankings move; a number 6 months old may be mid-tier now. State the leaderboard date you compared to.
 - **Running MTEB on a laptop CPU and giving up on retrieval tasks.** The retrieval category dominates runtime. A reasonable iteration loop is CPU → `FAST_SUBSET`; GPU → full English suite. Full English on CPU is a day+.

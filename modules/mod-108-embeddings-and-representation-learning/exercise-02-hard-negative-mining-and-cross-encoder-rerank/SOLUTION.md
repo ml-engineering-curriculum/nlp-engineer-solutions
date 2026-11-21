@@ -303,14 +303,18 @@ from collections import defaultdict
 import numpy as np
 
 
-def ndcg_at_k(relevances: list[int], k: int) -> float:
+def ndcg_at_k(relevances: list[int], k: int, num_relevant: int) -> float:
+    # `num_relevant` is the total count of relevant documents in the qrels for
+    # this query, not just the ones the retriever surfaced. Normalising IDCG
+    # against the retrieved-only subset silently masks first-stage recall misses
+    # (e.g. 1-of-2 gold at rank 1 scores 1.0 against the retrieved subset but
+    # ~0.613 against the full qrels, overstating both before/after lift).
     r = np.asarray(relevances)[:k]
     if r.sum() == 0:
         return 0.0
     gains = (2 ** r - 1) / np.log2(np.arange(len(r)) + 2)
-    ideal = sorted(relevances, reverse=True)[:k]
-    i_r = np.asarray(ideal)
-    i_gains = (2 ** i_r - 1) / np.log2(np.arange(len(i_r)) + 2)
+    n_ideal = min(num_relevant, k)
+    i_gains = 1.0 / np.log2(np.arange(n_ideal) + 2)
     return gains.sum() / i_gains.sum() if i_gains.sum() > 0 else 0.0
 
 
@@ -332,7 +336,7 @@ def evaluate(pipeline, queries: dict, qrels: dict, k_rerank: int = 100, k_metric
         _, I = pipeline.index.search(q_emb, k_rerank)
         retrieved_pids = [pipeline.corpus_ids[i] for i in I[0]]
         before_rel = [1 if pid in gold else 0 for pid in retrieved_pids]
-        before["ndcg@10"].append(ndcg_at_k(before_rel, k_metric))
+        before["ndcg@10"].append(ndcg_at_k(before_rel, k_metric, len(gold)))
         before["mrr@10"].append(mrr_at_k(before_rel, k_metric))
 
         # Rerank and compute same metrics on the reordered list.
@@ -341,7 +345,7 @@ def evaluate(pipeline, queries: dict, qrels: dict, k_rerank: int = 100, k_metric
         order = np.argsort(-scores)
         reranked_pids = [retrieved_pids[i] for i in order]
         after_rel = [1 if pid in gold else 0 for pid in reranked_pids]
-        after["ndcg@10"].append(ndcg_at_k(after_rel, k_metric))
+        after["ndcg@10"].append(ndcg_at_k(after_rel, k_metric, len(gold)))
         after["mrr@10"].append(mrr_at_k(after_rel, k_metric))
 
     def mean(d):
