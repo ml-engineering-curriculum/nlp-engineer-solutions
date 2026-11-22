@@ -2,14 +2,14 @@
 
 ML Engineering Curriculum · Level 30 · [learning](https://github.com/ml-engineering-curriculum/nlp-engineer-learning) · [solutions](https://github.com/ml-engineering-curriculum/nlp-engineer-solutions)
 
-_Generated 2026-11-15 by `aicg org completeness`._
+_Generated 2026-11-22 by `aicg org completeness`._
 
-**Overall: 66%**
+**Overall: 81%**
 
 | | Progress | Count |
 |---|---|---|
 | Learning | `██████████` 100% | 13/13 modules complete |
-| Solutions | `███░░░░░░░` 32% | 18/56 exercises solved |
+| Solutions | `██████░░░░` 62% | 35/56 exercises solved |
 
 ## Modules
 
@@ -19,9 +19,9 @@ _Generated 2026-11-15 by `aicg org completeness`._
 | `mod-102-classical-nlp` | ✅ Complete | 19,960 | 10 | 4 | — | 4/4 |
 | `mod-103-text-classification` | ✅ Complete | 20,150 | 8 | 4 | — | 4/4 |
 | `mod-104-sequence-labelling-and-information-extraction` | ✅ Complete | 32,092 | 13 | 5 | — | 5/5 |
-| `mod-105-question-answering-and-machine-reading` | ✅ Complete | 20,644 | 11 | 4 | — | 0/4 |
-| `mod-106-summarisation-and-controlled-generation` | ✅ Complete | 30,289 | 13 | 5 | — | 0/5 |
-| `mod-107-machine-translation-and-multilingual-nlp` | ✅ Complete | 31,507 | 12 | 5 | — | 0/5 |
+| `mod-105-question-answering-and-machine-reading` | ✅ Complete | 20,644 | 11 | 4 | — | 4/4 |
+| `mod-106-summarisation-and-controlled-generation` | ✅ Complete | 30,289 | 13 | 5 | — | 5/5 |
+| `mod-107-machine-translation-and-multilingual-nlp` | ✅ Complete | 31,507 | 12 | 5 | — | 5/5 |
 | `mod-108-embeddings-and-representation-learning` | ✅ Complete | 31,252 | 12 | 4 | — | 0/4 |
 | `mod-109-speech-text-interface` | ✅ Complete | 24,313 | 9 | 3 | — | 3/3 |
 | `mod-110-nlp-data-engineering` | ✅ Complete | 6,794 | 2 | 5 | — | 0/5 |
