@@ -22,7 +22,7 @@ _Generated 2026-11-22 by `aicg org completeness`._
 | `mod-105-question-answering-and-machine-reading` | ✅ Complete | 20,644 | 11 | 4 | — | 4/4 |
 | `mod-106-summarisation-and-controlled-generation` | ✅ Complete | 30,289 | 13 | 5 | — | 5/5 |
 | `mod-107-machine-translation-and-multilingual-nlp` | ✅ Complete | 31,507 | 12 | 5 | — | 5/5 |
-| `mod-108-embeddings-and-representation-learning` | ✅ Complete | 31,252 | 12 | 4 | — | 0/4 |
+| `mod-108-embeddings-and-representation-learning` | ✅ Complete | 31,252 | 12 | 4 | — | 4/4 |
 | `mod-109-speech-text-interface` | ✅ Complete | 24,313 | 9 | 3 | — | 3/3 |
 | `mod-110-nlp-data-engineering` | ✅ Complete | 6,794 | 2 | 5 | — | 0/5 |
 | `mod-111-nlp-evaluation` | ✅ Complete | 26,755 | 9 | 4 | — | 0/4 |

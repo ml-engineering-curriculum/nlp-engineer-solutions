@@ -12,3 +12,4 @@
 | 2026-11-18 | `fill-mod-106-summarisation-and-controlled-generation-solutions` | `mod-106-summarisation-and-controlled-generation` | Fill mod-106-summarisation-and-controlled-generation module exercise solutions |
 | 2026-11-19 | `fill-mod-107-machine-translation-and-multilingual-nlp-solutions` | `mod-107-machine-translation-and-multilingual-nlp` | Fill mod-107-machine-translation-and-multilingual-nlp module exercise solutions |
 | 2026-11-21 | `fill-mod-109-speech-text-interface-solutions` | `mod-109-speech-text-interface` | Fill mod-109-speech-text-interface module exercise solutions |
+| 2026-11-23 | `fill-mod-108-embeddings-and-representation-learning-solutions` | `mod-108-embeddings-and-representation-learning` | Fill mod-108-embeddings-and-representation-learning module exercise solutions |
