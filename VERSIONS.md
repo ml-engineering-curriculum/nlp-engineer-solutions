@@ -13,3 +13,4 @@
 | 2026-11-19 | `fill-mod-107-machine-translation-and-multilingual-nlp-solutions` | `mod-107-machine-translation-and-multilingual-nlp` | Fill mod-107-machine-translation-and-multilingual-nlp module exercise solutions |
 | 2026-11-21 | `fill-mod-109-speech-text-interface-solutions` | `mod-109-speech-text-interface` | Fill mod-109-speech-text-interface module exercise solutions |
 | 2026-11-23 | `fill-mod-108-embeddings-and-representation-learning-solutions` | `mod-108-embeddings-and-representation-learning` | Fill mod-108-embeddings-and-representation-learning module exercise solutions |
+| 2026-11-24 | `fill-mod-110-nlp-data-engineering-solutions` | `mod-110-nlp-data-engineering` | Fill mod-110-nlp-data-engineering module exercise solutions |
