@@ -15,3 +15,4 @@
 | 2026-11-23 | `fill-mod-108-embeddings-and-representation-learning-solutions` | `mod-108-embeddings-and-representation-learning` | Fill mod-108-embeddings-and-representation-learning module exercise solutions |
 | 2026-11-24 | `fill-mod-110-nlp-data-engineering-solutions` | `mod-110-nlp-data-engineering` | Fill mod-110-nlp-data-engineering module exercise solutions |
 | 2026-11-25 | `fill-mod-111-nlp-evaluation-solutions` | `mod-111-nlp-evaluation` | Fill mod-111-nlp-evaluation module exercise solutions |
+| 2026-11-26 | `fill-mod-112-production-nlp-pipelines-solutions` | `mod-112-production-nlp-pipelines` | Fill mod-112-production-nlp-pipelines module exercise solutions |
