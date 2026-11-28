@@ -16,3 +16,4 @@
 | 2026-11-24 | `fill-mod-110-nlp-data-engineering-solutions` | `mod-110-nlp-data-engineering` | Fill mod-110-nlp-data-engineering module exercise solutions |
 | 2026-11-25 | `fill-mod-111-nlp-evaluation-solutions` | `mod-111-nlp-evaluation` | Fill mod-111-nlp-evaluation module exercise solutions |
 | 2026-11-26 | `fill-mod-112-production-nlp-pipelines-solutions` | `mod-112-production-nlp-pipelines` | Fill mod-112-production-nlp-pipelines module exercise solutions |
+| 2026-11-27 | `fill-mod-113-nlp-systems-design-and-responsible-release-solutions` | `mod-113-nlp-systems-design-and-responsible-release` | Fill mod-113-nlp-systems-design-and-responsible-release module exercise solutions |
